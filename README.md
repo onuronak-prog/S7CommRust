@@ -1,0 +1,129 @@
+# s7commplus
+
+[![CI](https://github.com/sullibar/S7CommRust/actions/workflows/ci.yml/badge.svg)](https://github.com/sullibar/S7CommRust/actions/workflows/ci.yml)
+[![License: LGPL v3+](https://img.shields.io/badge/license-LGPL--3.0--or--later-blue.svg)](LICENSE)
+[![MSRV](https://img.shields.io/badge/MSRV-1.85-blue.svg)](Cargo.toml)
+
+A Rust port of [`thomas-v2/S7CommPlusDriver`](https://github.com/thomas-v2/S7CommPlusDriver):
+a driver for the proprietary Siemens **S7CommPlus** protocol used to read and write the
+symbolic ("optimized") variable space of S7-1200 / S7-1500 PLCs.
+
+It speaks the modern **TLS-wrapped** dialect and — through a separate code path — the older,
+non-TLS "integrity-protected" scheme, so one API reaches both current and legacy firmware.
+
+> **Status: end-to-end reads, writes, browsing, subscriptions, alarms, and authentication —
+> live-validated on real and simulated hardware.**
+>
+> - **TLS path** (`connect`): COTP → `InitSsl` → TLS 1.3 handshake → session → browse
+>   (Explore) → read/write symbolic tags by name → subscriptions → alarms → legitimation.
+>   Validated end-to-end against a **PLCSIM Advanced V2.9** instance; legitimation is proven
+>   both ways (correct password accepted, wrong password denied).
+> - **Legacy path** (`connect_legacy`): the non-TLS scheme for older firmware. Authentication
+>   and browsing are validated on a **physical S7-1200/1500**.
+>
+> Known gaps: alarm *reception* is unit-tested but not yet confirmed against a program with
+> firing alarms; a few upstream-unimplemented value types (`Variant`, `S7String`) remain
+> explicit errors because there is no wire format to port.
+
+## Use as a library
+
+`s7commplus` is a normal Rust library crate — add it as a dependency and drive a PLC through
+the [`Connection`] API:
+
+```toml
+[dependencies]
+s7commplus = "0.1.0"
+```
+
+```rust
+use std::time::Duration;
+use s7commplus::{Connection, value::PValue};
+
+fn main() -> s7commplus::Result<()> {
+    // Connect: TLS 1.3 handshake and session setup all happen here.
+    let mut plc = Connection::connect("192.168.0.1:102", Duration::from_secs(10))?;
+
+    // Read and write tags by symbol name — the driver resolves the address for you.
+    let titi = plc.read_tag("Data_block_1.titi")?;   // e.g. PValue::Int(123)
+    println!("titi = {titi:?}");
+    plc.write_tag("Data_block_1.titi", PValue::Int(456))?;
+
+    // Strings and M/Q/I-area tags (addressed by bare name) work too.
+    println!("name = {:?}", plc.read_string("Data_block_1.name")?);
+    Ok(())
+}
+```
+
+### What you can do
+
+- **Connect** — `connect` (TLS) or `connect_legacy` (older firmware).
+- **Browse** — `datablock_list`, `explore`, `type_info`, `resolve_symbol`.
+- **Read / write by name** — `read_tag` / `write_tag`, batched `read_tags` / `write_tags`,
+  and the string helpers `read_string` / `write_string`.
+- **Subscribe** — `subscribe` / `subscribe_with` for cyclic value pushes, then
+  `next_notification`; a finite credit limit is auto-refreshed for you.
+- **Alarms** — `subscribe_alarms`, then read `Notification::alarms()`; `Alarm::message()`
+  formats localized alarm text with substituted associated values.
+- **Authenticate** — `legitimate(user, password)` against a password-protected program.
+
+Values flow through the `value::PValue` enum, which models the ~90 PLC datatypes.
+
+## `s7tool` — a minimal browse/read/write CLI
+
+The repo is a Cargo workspace, and [`s7tool`](s7tool/) is a small binary crate that depends
+on `s7commplus` **by path** — so it doubles as a worked example of consuming the driver and
+as a quick way to poke at a live PLC. Copy its `src/main.rs` and dependency line as the
+starting point for your own app.
+
+```sh
+# Interactive prompt — type: browse, read <tag>, write <tag> <val>, level, help, quit
+cargo run -p s7tool -- --ip 192.168.0.1
+
+# ...or one-shot commands:
+cargo run -p s7tool -- --ip 192.168.0.1 browse
+cargo run -p s7tool -- --ip 192.168.0.1 read Data_block_1.toto Data_block_1.titi
+cargo run -p s7tool -- --ip 192.168.0.1 write Data_block_1.titi 456
+
+# Older, non-TLS firmware: add --legacy.
+cargo run -p s7tool -- --ip 192.168.0.1 --legacy browse
+```
+
+`write` infers the tag's type by reading its current value first, so `write DB.x 1` does the
+right thing whether `x` is a Bool, Int, Real, or String. The PLC address can also come from
+the `S7_PLC_IP` / `S7_PLC_PORT` environment variables.
+
+## Firmware requirements
+
+The **TLS** path (`connect`) targets the modern S7CommPlus dialect:
+
+- S7-1500 firmware ≥ V2.9, S7-1200 firmware ≥ V4.3, engineered with TIA Portal ≥ V17.
+
+Older firmware speaks a different, non-TLS "integrity-protected" scheme. That path
+(`connect_legacy`) is **not** part of upstream `S7CommPlusDriver`; its cryptography is ported
+from [HarpoS7](https://github.com/bonk-dev/HarpoS7) (MIT — see `LICENSE-HarpoS7`).
+
+## Build & test
+
+```sh
+cargo build
+cargo test       # codec + protocol unit tests run without hardware
+cargo clippy --all-targets
+```
+
+The `examples/` directory contains runnable probes (`read`, `write`, `browse`, `mq`,
+`legitimate`, `legacy_read`, …) that expect a reachable PLC; point them at one with
+`S7_PLC_IP=<addr>`. Set `SSLKEYLOGFILE=<path>` to dump TLS secrets for Wireshark analysis.
+
+For a bulk dump of every tag and its live value to a spreadsheet, use the `export_csv`
+example:
+
+```sh
+S7_PLC_IP=192.168.0.1 cargo run --example export_csv -- tags.csv
+# older firmware: add --legacy (PLCSIM family) or --real-plc (S7-1200/1500 hardware)
+```
+
+## License
+
+LGPL-3.0-or-later. This is a derivative work of `thomas-v2/S7CommPlusDriver`
+(LGPL-3.0-or-later); see [`LICENSE`](LICENSE). The legacy (non-TLS) support in `src/legacy/`
+is derived from HarpoS7 and used under the MIT License; see [`LICENSE-HarpoS7`](LICENSE-HarpoS7).

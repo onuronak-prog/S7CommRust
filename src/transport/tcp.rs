@@ -1,0 +1,235 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// Copyright (C) 2026 s7commplus-rs contributors
+// Ported from thomas-v2/S7CommPlusDriver Net/S7Client.cs + Net/MsgSocket.cs,
+// LGPL-3.0-or-later.
+
+//! Blocking TCP transport with TPKT (RFC 1006) + COTP (ISO 8073 class 0) framing.
+//!
+//! This mirrors the reference driver's `S7Client`/`MsgSocket`: it owns the socket and
+//! exchanges ISO transport packets. The COTP connection is established with a Connection
+//! Request (CR) / Connection Confirm (CC) handshake, after which payloads travel inside
+//! COTP Data (DT) frames.
+//!
+//! Once TLS is activated, the *encrypted TLS record bytes* are themselves carried as the
+//! payload of DT frames — this transport stays unchanged.
+
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::time::Duration;
+
+use crate::error::{Error, Result};
+
+/// Default S7 / ISO-on-TCP port.
+pub const ISO_TCP_PORT: u16 = 102;
+
+/// Default calling (source) TSAP — the local TSAP value (`0x0600` in the reference driver).
+pub const DEFAULT_CALLING_TSAP: u16 = 0x0600;
+
+/// Default called (destination) TSAP for S7CommPlus: ASCII `"SIMATIC-ROOT-HMI"` (16 bytes).
+pub const DEFAULT_CALLED_TSAP: &[u8; 16] = b"SIMATIC-ROOT-HMI";
+
+const TPKT_HEADER_LEN: usize = 4;
+const COTP_DT_HEADER: [u8; 3] = [0x02, 0xf0, 0x80]; // LI=2, DT, TPDU-NR + EOT
+const COTP_PDU_TYPE_CR: u8 = 0xe0;
+const COTP_PDU_TYPE_CC: u8 = 0xd0;
+const COTP_PDU_TYPE_DT: u8 = 0xf0;
+
+/// Maximum payload carried in a single TPKT frame (length field is a u16, minus headers).
+const MAX_TPKT_PAYLOAD: usize = u16::MAX as usize - TPKT_HEADER_LEN - COTP_DT_HEADER.len();
+
+/// A blocking ISO-on-TCP transport.
+pub(crate) struct IsoTcp {
+    stream: TcpStream,
+}
+
+impl IsoTcp {
+    /// Connect to `addr`, then perform the COTP CR/CC handshake using the default TSAPs.
+    pub fn connect<A: ToSocketAddrs>(addr: A, timeout: Duration) -> Result<Self> {
+        Self::connect_with_tsap(addr, DEFAULT_CALLING_TSAP, DEFAULT_CALLED_TSAP, timeout)
+    }
+
+    /// Connect and perform the COTP handshake with explicit TSAPs.
+    pub fn connect_with_tsap<A: ToSocketAddrs>(
+        addr: A,
+        calling_tsap: u16,
+        called_tsap: &[u8],
+        timeout: Duration,
+    ) -> Result<Self> {
+        let mut last_err: Option<Error> = None;
+        let mut stream = None;
+        for sa in addr.to_socket_addrs()? {
+            match TcpStream::connect_timeout(&sa, timeout) {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(e) => last_err = Some(e.into()),
+            }
+        }
+        let stream = stream.ok_or_else(|| {
+            last_err.unwrap_or_else(|| Error::framing("no socket addresses resolved"))
+        })?;
+        stream.set_nodelay(true)?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
+
+        let mut this = IsoTcp { stream };
+        this.iso_connect(calling_tsap, called_tsap)?;
+        Ok(this)
+    }
+
+    /// Perform the COTP Connection Request / Connection Confirm exchange.
+    fn iso_connect(&mut self, calling_tsap: u16, called_tsap: &[u8]) -> Result<()> {
+        let cr = build_cotp_cr(calling_tsap, called_tsap);
+        self.stream.write_all(&cr)?;
+        self.stream.flush()?;
+
+        let frame = self.recv_tpkt_frame()?;
+        // frame = COTP (starting at LI byte) ... ; byte[1] is the PDU type.
+        if frame.len() < 2 {
+            return Err(Error::framing("COTP confirm too short"));
+        }
+        if frame[1] != COTP_PDU_TYPE_CC {
+            return Err(Error::framing(format!(
+                "expected COTP CC (0x{COTP_PDU_TYPE_CC:02x}), got 0x{:02x}",
+                frame[1]
+            )));
+        }
+        Ok(())
+    }
+
+    /// Send `payload` as one or more COTP DT frames (fragmenting if it exceeds the TPKT
+    /// length limit, with the EOT bit set only on the final frame).
+    pub fn send_iso_packet(&mut self, payload: &[u8]) -> Result<()> {
+        let mut pos = 0;
+        loop {
+            let remaining = payload.len() - pos;
+            let chunk = remaining.min(MAX_TPKT_PAYLOAD);
+            let is_last = pos + chunk >= payload.len();
+
+            let total = TPKT_HEADER_LEN + COTP_DT_HEADER.len() + chunk;
+            let mut frame = Vec::with_capacity(total);
+            frame.push(0x03);
+            frame.push(0x00);
+            frame.extend_from_slice(&(total as u16).to_be_bytes());
+            frame.push(COTP_DT_HEADER[0]);
+            frame.push(COTP_DT_HEADER[1]);
+            // TPDU-NR + EOT byte: 0x80 marks end-of-TSDU, 0x00 marks "more follow".
+            frame.push(if is_last { 0x80 } else { 0x00 });
+            frame.extend_from_slice(&payload[pos..pos + chunk]);
+
+            self.stream.write_all(&frame)?;
+            pos += chunk;
+            if is_last {
+                break;
+            }
+        }
+        self.stream.flush()?;
+        Ok(())
+    }
+
+    /// Receive a complete ISO payload, reassembling COTP DT fragments until EOT.
+    pub fn recv_iso_packet(&mut self) -> Result<Vec<u8>> {
+        let mut payload = Vec::new();
+        loop {
+            let frame = self.recv_tpkt_frame()?;
+            // frame layout: [LI][PDU type][...]. For DT: [0x02][0xF0][TPDU-NR+EOT][data..].
+            if frame.len() < 3 {
+                return Err(Error::framing("COTP DT frame too short"));
+            }
+            if frame[1] != COTP_PDU_TYPE_DT {
+                return Err(Error::framing(format!(
+                    "expected COTP DT (0x{COTP_PDU_TYPE_DT:02x}), got 0x{:02x}",
+                    frame[1]
+                )));
+            }
+            let li = frame[0] as usize; // length indicator counts bytes after itself
+            let data_start = 1 + li;
+            if data_start > frame.len() {
+                return Err(Error::framing("COTP header length indicator out of range"));
+            }
+            let eot = frame[2] & 0x80 != 0;
+            payload.extend_from_slice(&frame[data_start..]);
+            if eot {
+                break;
+            }
+        }
+        Ok(payload)
+    }
+
+    /// Read one TPKT frame and return the COTP portion (everything after the 4-byte
+    /// TPKT header, starting at the COTP length-indicator byte).
+    fn recv_tpkt_frame(&mut self) -> Result<Vec<u8>> {
+        let mut header = [0u8; TPKT_HEADER_LEN];
+        self.stream.read_exact(&mut header)?;
+        if header[0] != 0x03 {
+            return Err(Error::framing(format!(
+                "bad TPKT version 0x{:02x}",
+                header[0]
+            )));
+        }
+        let total = u16::from_be_bytes([header[2], header[3]]) as usize;
+        if total < TPKT_HEADER_LEN {
+            return Err(Error::framing("TPKT length smaller than header"));
+        }
+        let mut rest = vec![0u8; total - TPKT_HEADER_LEN];
+        self.stream.read_exact(&mut rest)?;
+        Ok(rest)
+    }
+}
+
+/// Build the COTP Connection Request telegram (TPKT + COTP CR with TSAP parameters).
+fn build_cotp_cr(calling_tsap: u16, called_tsap: &[u8]) -> Vec<u8> {
+    // COTP fixed part after the length indicator: CR, DST-REF(0), SRC-REF(1), class 0.
+    let mut cotp = vec![
+        COTP_PDU_TYPE_CR,
+        0x00,
+        0x00, // DST-REF
+        0x00,
+        0x01, // SRC-REF
+        0x00, // class / option
+    ];
+    // Parameter: TPDU size (0xC0), len 1, value 0x0a = 1024 bytes.
+    cotp.extend_from_slice(&[0xc0, 0x01, 0x0a]);
+    // Parameter: calling (source) TSAP (0xC1), len 2.
+    cotp.push(0xc1);
+    cotp.push(0x02);
+    cotp.extend_from_slice(&calling_tsap.to_be_bytes());
+    // Parameter: called (destination) TSAP (0xC2), len N.
+    cotp.push(0xc2);
+    cotp.push(called_tsap.len() as u8);
+    cotp.extend_from_slice(called_tsap);
+
+    // Length indicator = number of bytes after the LI byte itself.
+    let li = cotp.len() as u8;
+    let total = TPKT_HEADER_LEN + 1 + cotp.len();
+
+    let mut frame = Vec::with_capacity(total);
+    frame.push(0x03);
+    frame.push(0x00);
+    frame.extend_from_slice(&(total as u16).to_be_bytes());
+    frame.push(li);
+    frame.extend_from_slice(&cotp);
+    frame
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cr_telegram_matches_reference() {
+        let cr = build_cotp_cr(DEFAULT_CALLING_TSAP, DEFAULT_CALLED_TSAP);
+        // TPKT length = 0x24 (36), COTP LI = 0x1f (31).
+        assert_eq!(&cr[0..4], &[0x03, 0x00, 0x00, 0x24]);
+        assert_eq!(cr[4], 0x1f);
+        assert_eq!(cr[5], COTP_PDU_TYPE_CR);
+        // calling TSAP 0x0600
+        assert_eq!(&cr[14..18], &[0xc1, 0x02, 0x06, 0x00]);
+        // called TSAP "SIMATIC-ROOT-HMI"
+        assert_eq!(cr[18], 0xc2);
+        assert_eq!(cr[19], 0x10);
+        assert_eq!(&cr[20..36], b"SIMATIC-ROOT-HMI");
+        assert_eq!(cr.len(), 36);
+    }
+}

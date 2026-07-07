@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+[package]
+name = "s7tool"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.85"
+license = "LGPL-3.0-or-later"
+description = "Minimal interactive CLI for the s7commplus driver: browse, read, and write PLC tags by symbol name."
+publish = false
+
+[dependencies]
+# Depend on the driver by path — this is exactly how an external app would consume it
+# (swap the path for a `git`/registry source). Nothing else here is driver-specific.
+s7commplus = { path = ".." }
+env_logger = "0.11" # so RUST_LOG=debug surfaces the driver's `log` output
+
+[[bin]]
+name = "s7tool"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"

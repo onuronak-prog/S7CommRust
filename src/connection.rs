@@ -1,0 +1,2058 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// Copyright (C) 2026 s7commplus-rs contributors
+// Ported from thomas-v2/S7CommPlusDriver S7CommPlusConnection.cs, LGPL-3.0-or-later.
+
+//! High-level connection orchestration (`S7CommPlusConnection`).
+//!
+//! Drives the connect sequence:
+//!
+//! 1. TCP + COTP connect.
+//! 2. Unencrypted `InitSsl` bootstrap.
+//! 3. TLS 1.3 handshake (everything after is encrypted).
+//! 4. `CreateObject` → server session.
+//!
+//! Legitimation and the data operations (Explore, Get/SetMultiVariables) build on the
+//! `request_response` helper and follow.
+
+use std::collections::{HashMap, VecDeque};
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::time::Duration;
+
+use crate::error::{Error, Result};
+use crate::legitimation::{build_legitimation_payload, crypto};
+use crate::proto::object::PObject;
+use crate::proto::{
+    self, CreateObjectResponse, GetMultiVariablesResponse, GetVarSubstreamedResponse, ItemAddress,
+    SetMultiVariablesResponse, SetVariableResponse,
+};
+use crate::transport::{IsoTcp, TlsChannel};
+use crate::value::PValue;
+use crate::wire::pdu::{self, functioncode, ids, protocol_version};
+
+/// `AccessSubArea` for data-block reads (`Ids.DB_ValueActual`).
+const DB_VALUE_ACTUAL: u32 = 2550;
+/// `AccessSubArea` for I/Q/M/timer/counter reads (`Ids.ControllerArea_ValueActual`).
+const CONTROLLER_AREA_VALUE_ACTUAL: u32 = 3736;
+/// Controller areas browsable by symbol: `(AccessArea RID, type-info relid, label)`, in the
+/// order the reference tries them (M, then Q, then I).
+const CONTROLLER_AREAS: [(u32, u32, &str); 3] = [
+    (82, 0x9003_0000, "MArea"),
+    (81, 0x9002_0000, "QArea"),
+    (80, 0x9001_0000, "IArea"),
+];
+/// Class id of a data-block object in an Explore of the PLC program.
+const DB_CLASS_RID: u32 = 2574;
+/// RID of the PLC program object (Explore root for browsing).
+const PLC_PROGRAM_RID: u32 = 3;
+/// Attribute id `ObjectVariableTypeName` (an object's name).
+const OBJECT_VARIABLE_TYPE_NAME: u32 = 233;
+/// Attributes requested when browsing for data blocks (so DB objects are returned).
+const BROWSE_ATTRS: [u32; 3] = [
+    OBJECT_VARIABLE_TYPE_NAME,
+    2521, /* BlockNumber */
+    4288, /* Comment */
+];
+/// RID of the OMS type-info container (`Ids.ObjectOMSTypeInfoContainer`) — one Explore returns
+/// every block's type info at once.
+const OMS_TYPE_INFO_CONTAINER_RID: u32 = 537;
+/// Softdatatype value for `BBOOL` (bit-packed bool) — needs the array-id bit-packing skip.
+const SDT_BBOOL: u8 = 40;
+/// Recursion guard for the browse walk (nested structs; S7 types are not cyclic).
+const MAX_BROWSE_DEPTH: usize = 16;
+/// How many times to reconnect (for a fresh challenge) when a legacy auth challenge can't be
+/// fingerprinted. ~1/6 of challenges are unusable, so a handful of retries makes it near-certain.
+const CHALLENGE_RETRIES: usize = 10;
+/// How many variables to read per `GetMultiVariables` request when reading a browsed batch.
+/// Real PLCs cap the items (and total size) per request; 48 was the measured sweet spot on a live
+/// S7-1200 (~12% faster than 32, still under the cap). [`Connection::read_var_values`] adaptively
+/// splits any batch a PLC refuses, so a larger value never loses data — it just costs a retry.
+/// Override with `S7_READ_BATCH`.
+const READ_BATCH: usize = 48;
+
+/// A discovered data block: its name, object relation id, number, and type-info relation id.
+#[derive(Debug, Clone)]
+pub struct DataBlock {
+    /// The block's symbolic name (e.g. `"Data_block_1"`).
+    pub name: String,
+    /// The block's object relation id (used as the access area for its tags).
+    pub relid: u32,
+    /// The DB number (the `N` in `DBN`).
+    pub number: u32,
+    /// Relation id of the block's type-info object (its member layout).
+    pub ti_relid: u32,
+}
+
+/// A leaf variable discovered by the browse walk: its fully-qualified symbol path, the access
+/// address parts, and its datatype. Read/write it via [`VarInfo::address`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VarInfo {
+    /// Fully-qualified symbol path (e.g. `"Motor_DB.axis[2].speed"`; area tags have no DB prefix).
+    pub name: String,
+    /// `AccessArea` — the DB relation id, or the M/Q/I area RID.
+    pub access_area: u32,
+    /// `AccessSubArea` — `DB_ValueActual` for DBs, `ControllerArea_ValueActual` for M/Q/I.
+    pub access_sub_area: u32,
+    /// The access LID sequence.
+    pub lids: Vec<u32>,
+    /// The member's softdatatype (1=Bool, 8=DInt, 14=Real, 19=String, 62=WString, …).
+    pub softdatatype: u8,
+    /// Declared max length for `String` members (0 otherwise).
+    pub string_max_len: u16,
+}
+
+impl VarInfo {
+    /// The [`ItemAddress`] to read or write this variable.
+    pub fn address(&self) -> ItemAddress {
+        ItemAddress {
+            symbol_crc: 0,
+            access_area: self.access_area,
+            access_sub_area: self.access_sub_area,
+            lid: self.lids.clone(),
+        }
+    }
+}
+
+/// A handle to an active subscription on the PLC. Poll it with [`Connection::next_notification`].
+/// The subscription lives until the connection is dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Subscription {
+    /// The subscription object id the PLC allocated.
+    pub object_id: u32,
+    /// The configured credit limit (`-1` = unlimited). When finite, [`Connection::next_notification`]
+    /// tops it up automatically before it expires.
+    credit_limit: i16,
+    /// The current credit target (grows on each auto-refresh).
+    next_credit_limit: i16,
+}
+
+/// Default per-operation socket timeout.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A connected S7CommPlus session.
+pub struct Connection {
+    tcp: IsoTcp,
+    /// TLS channel: `Some` for the TLS transport, `None` for the legacy non-TLS transport.
+    tls: Option<TlsChannel>,
+    /// Buffered TLS plaintext awaiting telegram deframing (TLS transport only).
+    rbuf: Vec<u8>,
+    /// Read cursor into `rbuf`: bytes before this are consumed. Avoids re-shifting the buffer on
+    /// every chunk (the buffer is cleared once a telegram is fully consumed).
+    rpos: usize,
+    /// Session key for the legacy non-TLS transport. `Some` ⇒ legacy mode: requests are wrapped
+    /// in the ProtocolVersion-0x03 per-PDU HMAC digest framing instead of going through TLS.
+    legacy_session_key: Option<[u8; 24]>,
+    session_id: u32,
+    session_id2: u32,
+    sequence_number: u16,
+    /// Integrity id counter for "get"-class requests.
+    integrity_id: u32,
+    /// Integrity id counter for "set"-class requests (Set*/Delete/CreateObject).
+    integrity_id_set: u32,
+    /// Whether requests carry an integrity id (enabled after the session exists).
+    with_integrity: bool,
+    /// Cache of type-info objects by relation id (populated lazily during browsing).
+    type_info_cache: HashMap<u32, PObject>,
+    /// Cached data-block list (lazily populated by [`Connection::datablock_list`]).
+    db_list: Option<Vec<DataBlock>>,
+    /// Set once a request/response fails partway through. A poisoned connection has an
+    /// unknown sequence/integrity-id state relative to the PLC, so every subsequent
+    /// [`Connection::request_response`] short-circuits with [`Error::Closed`].
+    poisoned: bool,
+    /// How this connection was established, so [`Connection::reconnect`] can re-create it.
+    reconnect_target: ReconnectTarget,
+    /// When set, read operations transparently reconnect + retry once on a lost connection.
+    auto_reconnect: bool,
+    /// Notification telegrams received while awaiting a response (an active subscription pushes
+    /// them asynchronously); delivered in order by [`Connection::next_notification`].
+    pending_notifications: VecDeque<Vec<u8>>,
+}
+
+/// Captures how a [`Connection`] was created so it can be re-established after a network drop.
+#[derive(Debug, Clone)]
+enum ReconnectTarget {
+    Tls {
+        addrs: Vec<SocketAddr>,
+        timeout: Duration,
+    },
+    LegacyPlcsim {
+        addrs: Vec<SocketAddr>,
+        timeout: Duration,
+    },
+    RealPlc {
+        addrs: Vec<SocketAddr>,
+        timeout: Duration,
+        /// The public key that authenticated (so reconnect skips the auto-key trial). `None`
+        /// means "auto-detect/look up by fingerprint again".
+        key: Option<Vec<u8>>,
+    },
+}
+
+impl Connection {
+    /// Connect to a PLC at `addr` and drive the sequence through session creation.
+    pub fn connect<A: ToSocketAddrs>(addr: A, timeout: Duration) -> Result<Self> {
+        let addrs: Vec<SocketAddr> = addr.to_socket_addrs()?.collect();
+        let mut tcp = IsoTcp::connect(addrs.as_slice(), timeout)?;
+
+        // Step 2: unencrypted InitSsl bootstrap (sequence number 1).
+        let init_req = proto::init_ssl_request_default();
+        tcp.send_iso_packet(&init_req)?;
+        let init_resp_bytes = tcp.recv_iso_packet()?;
+        let init_resp = proto::parse_init_ssl_response(&init_resp_bytes)?;
+        if !init_resp.is_ok() {
+            return Err(Error::protocol(format!(
+                "InitSsl rejected: return_value=0x{:016x}",
+                init_resp.return_value
+            )));
+        }
+
+        // Step 3: TLS handshake.
+        let mut tls = TlsChannel::new()?;
+        tls.handshake(&mut tcp)?;
+
+        let mut conn = Connection {
+            tcp,
+            tls: Some(tls),
+            rbuf: Vec::new(),
+            rpos: 0,
+            legacy_session_key: None,
+            session_id: ids::OBJECT_NULL_SERVER_SESSION,
+            session_id2: 0,
+            sequence_number: 1, // InitSsl consumed sequence number 1
+            integrity_id: 0,
+            integrity_id_set: 0,
+            with_integrity: false,
+            type_info_cache: HashMap::new(),
+            db_list: None,
+            poisoned: false,
+            reconnect_target: ReconnectTarget::Tls { addrs, timeout },
+            auto_reconnect: false,
+            pending_notifications: VecDeque::new(),
+        };
+
+        // Step 4: CreateObject → session.
+        let create_resp = conn.create_session()?;
+        // Step 4b: SetMultiVariables session setup — echo ServerSessionVersion (306) back.
+        // The PLC rejects later requests (Explore, reads) until this completes.
+        let server_session_version =
+            create_resp
+                .server_session_version()
+                .cloned()
+                .ok_or_else(|| {
+                    Error::protocol("CreateObject response missing ServerSessionVersion (306)")
+                })?;
+        conn.setup_session(&server_session_version)?;
+        // Subsequent requests carry an integrity id.
+        conn.with_integrity = true;
+        Ok(conn)
+    }
+
+    /// Connect to a **legacy** (pre-TLS, S7-1500 FW < 2.9) PLC: TCP + COTP, then plaintext
+    /// `CreateObject` and the PlcSim challenge-response authentication. After this, every request
+    /// is wrapped in the ProtocolVersion-`0x03` per-PDU HMAC-SHA256 digest framing instead of
+    /// TLS. All the high-level operations (`read_tag`, `browse`, …) then work unchanged.
+    ///
+    /// Hardware-validated on an S7-PLCSIM **Advanced** FW2.8 instance.
+    pub fn connect_legacy<A: ToSocketAddrs>(addr: A, timeout: Duration) -> Result<Self> {
+        let addrs: Vec<std::net::SocketAddr> = addr.to_socket_addrs()?.collect();
+        // Retry on a challenge that can't be fingerprinted (a fresh connection = fresh challenge).
+        for _ in 0..CHALLENGE_RETRIES {
+            let mut tcp = IsoTcp::connect(addrs.as_slice(), timeout)?;
+            match crate::legacy::session::handshake(&mut tcp, &mut |b| {
+                getrandom::getrandom(b).expect("OS CSPRNG")
+            })? {
+                Some((session_key, session_id, session_id2)) => {
+                    let target = ReconnectTarget::LegacyPlcsim {
+                        addrs: addrs.clone(),
+                        timeout,
+                    };
+                    return Ok(Self::new_legacy(
+                        tcp,
+                        session_key,
+                        session_id,
+                        session_id2,
+                        target,
+                    ));
+                }
+                None => continue, // unfingerprintable challenge — reconnect
+            }
+        }
+        Err(Error::protocol(
+            "legacy PLCSIM: no usable (fingerprintable) challenge after several reconnects",
+        ))
+    }
+
+    /// Connect to a **real** S7-1200/1500 on legacy (pre-TLS) firmware. The key family (`00:`
+    /// = S7-1500, `01:` = S7-1200) and the PLC's public key are auto-detected from the fingerprint
+    /// in the `CreateObject` response and looked up in the bundled key store. If the PLC uses
+    /// a key that isn't bundled, use
+    /// [`Self::connect_real_plc_with_key`]. After auth, the transport and all high-level operations
+    /// are identical to [`Self::connect_legacy`].
+    ///
+    /// **Status:** the auth crypto and request assembly are validated offline (byte-exact vs the
+    /// `AuthenticateRealPlc` golden vectors); the *live* handshake against physical hardware has
+    /// not yet been verified (no real `00:`/`01:` unit was available).
+    pub fn connect_real_plc<A: ToSocketAddrs>(addr: A, timeout: Duration) -> Result<Self> {
+        Self::connect_real_plc_impl(addr, timeout, None)
+    }
+
+    /// Like [`Self::connect_real_plc`] but with an explicit 40-byte `public_key` (for a PLC whose
+    /// key is not in the bundled store). The family is still auto-detected from the fingerprint.
+    pub fn connect_real_plc_with_key<A: ToSocketAddrs>(
+        addr: A,
+        timeout: Duration,
+        public_key: &[u8],
+    ) -> Result<Self> {
+        Self::connect_real_plc_impl(addr, timeout, Some(public_key))
+    }
+
+    fn connect_real_plc_impl<A: ToSocketAddrs>(
+        addr: A,
+        timeout: Duration,
+        public_key: Option<&[u8]>,
+    ) -> Result<Self> {
+        use crate::legacy::realplc::{real_plc_handshake, RealPlcOutcome};
+        // Resolve once so we can reconnect: a wrong key makes the PLC reset the connection, and
+        // ~1/6 of challenges can't be fingerprinted (a fresh connection gets a fresh challenge).
+        let addrs: Vec<std::net::SocketAddr> = addr.to_socket_addrs()?.collect();
+        let mut rng = |b: &mut [u8]| getrandom::getrandom(b).expect("OS CSPRNG");
+
+        // One auth attempt with a given key, reconnecting on an unfingerprintable challenge.
+        // Returns `Ok(Some(conn))` on success, `Ok(None)` if the key was wrong (or exhausted
+        // retries), and propagates a family for the key-not-bundled case via `Err`-free channel.
+        // Phase 1: try the explicit/auto-looked-up key; discover the family if none is bundled.
+        let mut family = None;
+        for _ in 0..CHALLENGE_RETRIES {
+            let mut tcp = IsoTcp::connect(addrs.as_slice(), timeout)?;
+            match real_plc_handshake(&mut tcp, public_key, &mut rng)? {
+                RealPlcOutcome::Authenticated {
+                    session_key,
+                    session_id,
+                    session_id2,
+                } => {
+                    let target = ReconnectTarget::RealPlc {
+                        addrs: addrs.clone(),
+                        timeout,
+                        key: public_key.map(<[u8]>::to_vec),
+                    };
+                    return Ok(Self::new_legacy(
+                        tcp,
+                        session_key,
+                        session_id,
+                        session_id2,
+                        target,
+                    ));
+                }
+                RealPlcOutcome::RetryChallenge => continue, // fresh connection, fresh challenge
+                RealPlcOutcome::KeyNotBundled { family: f } => {
+                    family = Some(f);
+                    break;
+                }
+            }
+        }
+        let Some(family) = family else {
+            return Err(Error::protocol(
+                "real-PLC: no usable (fingerprintable) challenge after several reconnects",
+            ));
+        };
+
+        // Phase 2: the PLC advertised only its family — auto-try each bundled key for it, each
+        // with its own challenge-retry.
+        let candidates = crate::legacy::pubkey_store::candidates(family);
+        log::info!(
+            "real-PLC {family:?}: key id not advertised — auto-trying {} bundled key(s)",
+            candidates.len()
+        );
+        let mut last_err: Option<Error> = None;
+        for (i, key) in candidates.iter().enumerate() {
+            for _ in 0..CHALLENGE_RETRIES {
+                let mut t = match IsoTcp::connect(addrs.as_slice(), timeout) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        last_err = Some(e);
+                        break;
+                    }
+                };
+                match real_plc_handshake(&mut t, Some(key), &mut rng) {
+                    Ok(RealPlcOutcome::Authenticated {
+                        session_key,
+                        session_id,
+                        session_id2,
+                    }) => {
+                        log::info!(
+                            "real-PLC: authenticated with bundled key {}/{}",
+                            i + 1,
+                            candidates.len()
+                        );
+                        let target = ReconnectTarget::RealPlc {
+                            addrs: addrs.clone(),
+                            timeout,
+                            key: Some(key.to_vec()), // the bundled key that worked
+                        };
+                        return Ok(Self::new_legacy(
+                            t,
+                            session_key,
+                            session_id,
+                            session_id2,
+                            target,
+                        ));
+                    }
+                    Ok(RealPlcOutcome::RetryChallenge) => continue, // fresh challenge, same key
+                    Ok(RealPlcOutcome::KeyNotBundled { .. }) => break, // unreachable with a key
+                    Err(e) => {
+                        last_err = Some(e); // wrong key → PLC reset; move to the next candidate
+                        break;
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            Error::protocol(format!(
+                "real-PLC {family:?}: none of the {} bundled keys authenticated; pass the key explicitly",
+                candidates.len()
+            ))
+        }))
+    }
+
+    /// Build a legacy (non-TLS) `Connection` from a handshaken socket + derived session key.
+    fn new_legacy(
+        tcp: IsoTcp,
+        session_key: [u8; 24],
+        session_id: u32,
+        session_id2: u32,
+        reconnect_target: ReconnectTarget,
+    ) -> Self {
+        Connection {
+            tcp,
+            tls: None,
+            rbuf: Vec::new(),
+            rpos: 0,
+            legacy_session_key: Some(session_key),
+            session_id,
+            session_id2,
+            sequence_number: 2,
+            integrity_id: 0,
+            integrity_id_set: 0,
+            with_integrity: true,
+            type_info_cache: HashMap::new(),
+            db_list: None,
+            poisoned: false,
+            reconnect_target,
+            auto_reconnect: false,
+            pending_notifications: VecDeque::new(),
+        }
+    }
+
+    /// The negotiated session id.
+    pub fn session_id(&self) -> u32 {
+        self.session_id
+    }
+
+    /// The secondary session id.
+    pub fn session_id2(&self) -> u32 {
+        self.session_id2
+    }
+
+    /// Re-establish the connection using the parameters it was created with, after a network drop.
+    /// This starts a **fresh session**: a new session id, the sequence/integrity counters reset,
+    /// and the type-info/DB caches are cleared. Any prior legitimation and subscriptions are lost
+    /// and must be redone by the caller. Clears the poisoned state on success.
+    ///
+    /// For the legacy real-PLC transport this reuses the key that authenticated, so it skips the
+    /// slow auto-key trial.
+    pub fn reconnect(&mut self) -> Result<()> {
+        let auto = self.auto_reconnect;
+        let fresh = match self.reconnect_target.clone() {
+            ReconnectTarget::Tls { addrs, timeout } => Self::connect(addrs.as_slice(), timeout)?,
+            ReconnectTarget::LegacyPlcsim { addrs, timeout } => {
+                Self::connect_legacy(addrs.as_slice(), timeout)?
+            }
+            ReconnectTarget::RealPlc {
+                addrs,
+                timeout,
+                key,
+            } => match key {
+                Some(k) => Self::connect_real_plc_with_key(addrs.as_slice(), timeout, &k)?,
+                None => Self::connect_real_plc(addrs.as_slice(), timeout)?,
+            },
+        };
+        *self = fresh;
+        self.auto_reconnect = auto;
+        Ok(())
+    }
+
+    /// Enable/disable transparent auto-reconnect for **read** operations (default off). When on, a
+    /// read that fails with a lost connection reconnects (see [`Connection::reconnect`]) and retries
+    /// once. Writes and subscriptions are never auto-retried — a write may already have been applied,
+    /// and a subscription is bound to the old session — so handle those with an explicit
+    /// [`Connection::reconnect`] plus your own re-subscribe / re-issue.
+    pub fn set_auto_reconnect(&mut self, enabled: bool) {
+        self.auto_reconnect = enabled;
+    }
+
+    /// The exported `EXPERIMENTAL_OMS` keying material (for TLS legitimation). Errors on a legacy
+    /// connection, which has no TLS layer.
+    pub fn export_oms_secret(&self) -> Result<[u8; crate::transport::tls::OMS_SECRET_LEN]> {
+        self.tls
+            .as_ref()
+            .ok_or_else(|| Error::protocol("export_oms_secret: not a TLS connection"))?
+            .export_oms_secret()
+    }
+
+    /// Allocate the next sequence number (matches the reference `GetNextSequenceNumber`).
+    fn next_sequence_number(&mut self) -> u16 {
+        self.sequence_number = if self.sequence_number == u16::MAX {
+            1
+        } else {
+            self.sequence_number + 1
+        };
+        self.sequence_number
+    }
+
+    /// Perform CreateObject for the null server session and record the new ids.
+    fn create_session(&mut self) -> Result<CreateObjectResponse> {
+        let seq = self.next_sequence_number();
+        let req = proto::build_create_session_request(seq, self.session_id, false, 0)?;
+        let resp_bytes = self.request_response(&req)?;
+        let resp = proto::parse_create_object_response(&resp_bytes)?;
+        if !resp.header.is_ok() {
+            return Err(Error::protocol(format!(
+                "CreateObject rejected: return_value=0x{:016x}",
+                resp.header.return_value
+            )));
+        }
+        self.session_id = resp
+            .session_id()
+            .ok_or_else(|| Error::protocol("CreateObject returned no session id"))?;
+        self.session_id2 = resp.session_id2().unwrap_or(0);
+        Ok(resp)
+    }
+
+    /// Step 4b: session setup. Echo the `ServerSessionVersion` Struct back to the session
+    /// object via SetMultiVariables (no integrity id), completing session establishment.
+    fn setup_session(&mut self, server_session_version: &PValue) -> Result<()> {
+        let seq = self.next_sequence_number();
+        let req = proto::build_session_setup_request(seq, self.session_id, server_session_version)?;
+        let resp_bytes = self.request_response(&req)?;
+        let resp = proto::parse_set_multi_response(&resp_bytes)?;
+        if !resp.header.is_ok() {
+            return Err(Error::protocol(format!(
+                "session setup (SetMultiVariables) rejected: return_value=0x{:016x}",
+                resp.header.return_value
+            )));
+        }
+        Ok(())
+    }
+
+    /// Allocate the next integrity id for `function_code` (matches `GetNextIntegrityId`):
+    /// Set/Delete/CreateObject share one counter, everything else another. Both start at 0
+    /// and pre-increment, so the first id of each class is 1.
+    fn next_integrity_id(&mut self, function_code: u16) -> u32 {
+        let counter = match function_code {
+            functioncode::SET_MULTI_VARIABLES
+            | functioncode::SET_VARIABLE
+            | functioncode::SET_VAR_SUBSTREAMED
+            | functioncode::DELETE_OBJECT
+            | functioncode::CREATE_OBJECT => &mut self.integrity_id_set,
+            _ => &mut self.integrity_id,
+        };
+        *counter = if *counter == u32::MAX {
+            0
+        } else {
+            *counter + 1
+        };
+        *counter
+    }
+
+    /// Read one or more symbolic variables via GetMultiVariables. If auto-reconnect is enabled
+    /// (see [`Connection::set_auto_reconnect`]) and the connection is lost, this reconnects and
+    /// retries once (reads are idempotent, so retrying is safe).
+    pub fn read_variables(
+        &mut self,
+        addresses: &[ItemAddress],
+    ) -> Result<GetMultiVariablesResponse> {
+        match self.read_variables_once(addresses) {
+            Err(e) if self.auto_reconnect && e.is_connection_lost() => {
+                self.reconnect()?;
+                self.read_variables_once(addresses)
+            }
+            other => other,
+        }
+    }
+
+    fn read_variables_once(
+        &mut self,
+        addresses: &[ItemAddress],
+    ) -> Result<GetMultiVariablesResponse> {
+        let seq = self.next_sequence_number();
+        let with_integrity = self.with_integrity;
+        let integrity = if with_integrity {
+            self.next_integrity_id(functioncode::GET_MULTI_VARIABLES)
+        } else {
+            0
+        };
+        let req = proto::build_get_multi_request(
+            seq,
+            self.session_id,
+            addresses,
+            with_integrity,
+            integrity,
+        )?;
+        let resp_bytes = self.request_response(&req)?;
+        let resp = proto::parse_get_multi_response(&resp_bytes)?;
+        if !resp.header.is_ok() {
+            return Err(Error::protocol(format!(
+                "GetMultiVariables rejected: return_value=0x{:016x}",
+                resp.header.return_value
+            )));
+        }
+        Ok(resp)
+    }
+
+    /// Write one or more symbolic variables via SetMultiVariables (paired by position).
+    pub fn write_variables(
+        &mut self,
+        addresses: &[ItemAddress],
+        values: &[PValue],
+    ) -> Result<SetMultiVariablesResponse> {
+        let seq = self.next_sequence_number();
+        let with_integrity = self.with_integrity;
+        let integrity = if with_integrity {
+            self.next_integrity_id(functioncode::SET_MULTI_VARIABLES)
+        } else {
+            0
+        };
+        let req = proto::build_set_multi_request(
+            seq,
+            self.session_id,
+            addresses,
+            values,
+            with_integrity,
+            integrity,
+        )?;
+        let resp_bytes = self.request_response(&req)?;
+        let resp = proto::parse_set_multi_response(&resp_bytes)?;
+        if !resp.header.is_ok() {
+            return Err(Error::protocol(format!(
+                "SetMultiVariables rejected: return_value=0x{:016x}",
+                resp.header.return_value
+            )));
+        }
+        Ok(resp)
+    }
+
+    /// Create a subscription that monitors `items`, refreshed every `cycle_time_ms` milliseconds.
+    /// The PLC then pushes notifications; read them with [`Connection::next_notification`].
+    ///
+    /// Uses an unlimited credit limit, so no periodic credit top-up is needed and each cycle
+    /// yields a notification (empty when nothing changed) — [`Connection::next_notification`]
+    /// therefore returns within the socket read timeout.
+    pub fn subscribe(
+        &mut self,
+        items: &[proto::SubscriptionItem],
+        cycle_time_ms: u16,
+    ) -> Result<Subscription> {
+        self.subscribe_with(
+            items,
+            cycle_time_ms,
+            proto::subscription::DEFAULT_ROUTE_MODE,
+            proto::subscription::DEFAULT_CREDIT_LIMIT,
+        )
+    }
+
+    /// Like [`Connection::subscribe`] but with an explicit route mode and credit limit (advanced;
+    /// see the reference route-mode/credit table). A finite credit limit requires topping the
+    /// credit up before it expires, which this driver does not yet automate — prefer the
+    /// unlimited default via [`Connection::subscribe`].
+    pub fn subscribe_with(
+        &mut self,
+        items: &[proto::SubscriptionItem],
+        cycle_time_ms: u16,
+        route_mode: u8,
+        credit_limit: i16,
+    ) -> Result<Subscription> {
+        let seq = self.next_sequence_number();
+        let with_integrity = self.with_integrity;
+        let integrity = if with_integrity {
+            self.next_integrity_id(functioncode::CREATE_OBJECT)
+        } else {
+            0
+        };
+        let req = proto::build_subscription_create_request(
+            seq,
+            self.session_id,
+            self.session_id2,
+            with_integrity,
+            integrity,
+            1, // change counter (first subscription on this connection)
+            route_mode,
+            cycle_time_ms,
+            credit_limit,
+            items,
+        )?;
+        let resp_bytes = self.request_response(&req)?;
+        let resp = proto::parse_create_object_response(&resp_bytes)?;
+        if !resp.header.is_ok() {
+            return Err(Error::protocol(format!(
+                "subscription create rejected: return_value=0x{:016x}",
+                resp.header.return_value
+            )));
+        }
+        let object_id = resp
+            .object_ids
+            .first()
+            .copied()
+            .ok_or_else(|| Error::protocol("subscription create returned no object id"))?;
+        Ok(Subscription {
+            object_id,
+            credit_limit,
+            next_credit_limit: credit_limit,
+        })
+    }
+
+    /// Create an **alarm** subscription (program/system alarms). The PLC then pushes alarm
+    /// notifications; read them with [`Connection::next_notification`] and decode via
+    /// [`proto::Notification::alarms`]. Uses an unlimited credit limit.
+    ///
+    /// Alarms are event-driven: when no alarm arrives within the socket read timeout,
+    /// [`Connection::next_notification`] returns a timeout error **without** poisoning the
+    /// connection, so you can simply poll again.
+    ///
+    /// NOTE: the PLC only sends alarm events if the program actually defines and triggers alarms
+    /// (e.g. `Program_Alarm` instructions). The subscription is created regardless.
+    pub fn subscribe_alarms(&mut self) -> Result<Subscription> {
+        self.subscribe_alarms_with(-1)
+    }
+
+    /// Like [`Connection::subscribe_alarms`] but with an explicit credit limit (`-1` = unlimited).
+    pub fn subscribe_alarms_with(&mut self, credit_limit: i16) -> Result<Subscription> {
+        let seq = self.next_sequence_number();
+        let with_integrity = self.with_integrity;
+        let integrity = if with_integrity {
+            self.next_integrity_id(functioncode::CREATE_OBJECT)
+        } else {
+            0
+        };
+        let req = proto::build_alarm_subscription_create_request(
+            seq,
+            self.session_id,
+            self.session_id2,
+            with_integrity,
+            integrity,
+            credit_limit,
+        )?;
+        let resp_bytes = self.request_response(&req)?;
+        let resp = proto::parse_create_object_response(&resp_bytes)?;
+        if !resp.header.is_ok() {
+            return Err(Error::protocol(format!(
+                "alarm subscription create rejected: return_value=0x{:016x}",
+                resp.header.return_value
+            )));
+        }
+        let object_id = resp
+            .object_ids
+            .first()
+            .copied()
+            .ok_or_else(|| Error::protocol("alarm subscription returned no object id"))?;
+        Ok(Subscription {
+            object_id,
+            credit_limit,
+            next_credit_limit: credit_limit,
+        })
+    }
+
+    /// Delete a server object by id (e.g. tear down a subscription, freeing it on the PLC instead
+    /// of relying on the connection dropping). Uses the set-class integrity counter.
+    pub fn delete_object(&mut self, object_id: u32) -> Result<()> {
+        let seq = self.next_sequence_number();
+        let with_integrity = self.with_integrity;
+        let integrity = if with_integrity {
+            self.next_integrity_id(functioncode::DELETE_OBJECT)
+        } else {
+            0
+        };
+        let req = proto::build_delete_object_request(
+            seq,
+            self.session_id,
+            object_id,
+            with_integrity,
+            integrity,
+        )?;
+        let resp = self.request_response(&req)?;
+        let header = proto::parse_delete_object_response(&resp)?;
+        if !header.is_ok() {
+            return Err(Error::protocol(format!(
+                "DeleteObject rejected: return_value=0x{:016x}",
+                header.return_value
+            )));
+        }
+        Ok(())
+    }
+
+    /// Delete a subscription (from [`Connection::subscribe`] / [`Connection::subscribe_alarms`]),
+    /// freeing it on the PLC.
+    pub fn delete_subscription(&mut self, sub: &Subscription) -> Result<()> {
+        self.delete_object(sub.object_id)
+    }
+
+    /// Block until the PLC pushes the next notification for `sub`, and parse it. Times out per the
+    /// connection's socket read timeout; for a cyclic subscription a notification arrives each
+    /// cycle, so a timeout means the PLC went silent (surfaced as a transport error, poisoning the
+    /// connection).
+    ///
+    /// When `sub` was created with a *finite* credit limit, this tops the credit up (a no-response
+    /// `SetVariable`) before the credit tick reaches the limit, keeping the flow going. With the
+    /// default unlimited credit this is a no-op.
+    pub fn next_notification(&mut self, sub: &mut Subscription) -> Result<proto::Notification> {
+        if self.poisoned {
+            return Err(Error::closed(
+                "connection poisoned by an earlier transport failure; reconnect required",
+            ));
+        }
+        // Deliver any notifications buffered while awaiting a response before reading the socket.
+        let bytes = if let Some(b) = self.pending_notifications.pop_front() {
+            b
+        } else {
+            match self.recv_notification_telegram() {
+                Ok(b) => b,
+                Err(e) => {
+                    // A plain read timeout (no data yet) leaves the connection usable — don't
+                    // poison it, so event-driven (alarm) subscriptions can just poll again.
+                    if !e.is_timeout() {
+                        self.poisoned = true;
+                    }
+                    return Err(e);
+                }
+            }
+        };
+        let notif = proto::parse_notification(&bytes)?;
+
+        // Finite-credit auto-refresh: raise the limit one tick before it expires.
+        if sub.credit_limit >= 0 && i16::from(notif.credit_tick) >= sub.next_credit_limit - 1 {
+            const STEP: i16 = 5;
+            sub.next_credit_limit = ((sub.next_credit_limit + STEP) % 255).max(STEP);
+            let seq = self.next_sequence_number();
+            let with_integrity = self.with_integrity;
+            let integrity = if with_integrity {
+                self.next_integrity_id(functioncode::SET_VARIABLE)
+            } else {
+                0
+            };
+            let req = proto::subscription::build_credit_limit_request(
+                seq,
+                self.session_id,
+                sub.object_id,
+                with_integrity,
+                integrity,
+                sub.next_credit_limit,
+            )?;
+            if let Err(e) = self.send_no_response(&req) {
+                self.poisoned = true;
+                return Err(e);
+            }
+        }
+        Ok(notif)
+    }
+
+    /// Send a framed request without waiting for a reply (for `0x74` "no response" requests like
+    /// the subscription credit top-up). Transport-aware (legacy V3 digest vs TLS).
+    fn send_no_response(&mut self, framed: &[u8]) -> Result<()> {
+        if let Some(key) = self.legacy_session_key {
+            let v3 = crate::legacy::session::frame_v3(&key, framed)?;
+            self.tcp.send_iso_packet(&v3)
+        } else {
+            self.tls
+                .as_mut()
+                .ok_or_else(|| Error::protocol("no TLS channel on a non-legacy connection"))?
+                .send(&mut self.tcp, framed)
+        }
+    }
+
+    /// Read a single object attribute via GetVarSubstreamed.
+    pub fn get_var_substreamed(&mut self, address: u32) -> Result<GetVarSubstreamedResponse> {
+        let seq = self.next_sequence_number();
+        let with_integrity = self.with_integrity;
+        let integrity = if with_integrity {
+            self.next_integrity_id(functioncode::GET_VAR_SUBSTREAMED)
+        } else {
+            0
+        };
+        let req = proto::build_get_var_substreamed_request(
+            protocol_version::V2,
+            seq,
+            self.session_id,
+            self.session_id, // InObjectId: read attributes of the session object
+            address,
+            with_integrity,
+            integrity,
+        )?;
+        let resp_bytes = self.request_response(&req)?;
+        proto::parse_get_var_substreamed_response(&resp_bytes)
+    }
+
+    /// Write a single object attribute via SetVariable.
+    pub fn set_variable(&mut self, address: u32, value: &PValue) -> Result<SetVariableResponse> {
+        let seq = self.next_sequence_number();
+        let with_integrity = self.with_integrity;
+        let integrity = if with_integrity {
+            self.next_integrity_id(functioncode::SET_VARIABLE)
+        } else {
+            0
+        };
+        let req = proto::build_set_variable_request(
+            protocol_version::V2,
+            seq,
+            self.session_id,
+            self.session_id, // InObjectId: write attributes of the session object
+            address,
+            value,
+            with_integrity,
+            integrity,
+        )?;
+        let resp_bytes = self.request_response(&req)?;
+        proto::parse_set_variable_response(&resp_bytes)
+    }
+
+    /// Explore the object tree under `explore_id` and return the raw response telegram
+    /// bytes (decode with [`crate::proto::parse_explore_response`]). `recursive` =
+    /// `ExploreChildsRecursive`, `parents` = `ExploreParents`. `attrs` restricts which
+    /// attributes are returned per object (empty = all); some objects (e.g. data blocks)
+    /// only appear when the relevant attributes are requested.
+    pub fn explore_raw(
+        &mut self,
+        explore_id: u32,
+        recursive: u8,
+        parents: u8,
+        attrs: &[u32],
+    ) -> Result<Vec<u8>> {
+        let seq = self.next_sequence_number();
+        let with_integrity = self.with_integrity;
+        let integrity = if with_integrity {
+            self.next_integrity_id(functioncode::EXPLORE)
+        } else {
+            0
+        };
+        let req = proto::build_explore_request(
+            protocol_version::V2,
+            seq,
+            self.session_id,
+            explore_id,
+            ids::NONE,
+            recursive,
+            parents,
+            attrs,
+            with_integrity,
+            integrity,
+        )?;
+        self.request_response(&req)
+    }
+
+    /// Whether requests currently carry an integrity id.
+    pub fn with_integrity(&self) -> bool {
+        self.with_integrity
+    }
+
+    /// Explore the object tree under `explore_id` and decode the response. `attrs` restricts
+    /// the returned attributes (empty = all).
+    pub fn explore(
+        &mut self,
+        explore_id: u32,
+        recursive: u8,
+        parents: u8,
+        attrs: &[u32],
+    ) -> Result<proto::ExploreResponse> {
+        let with_integrity = self.with_integrity;
+        let raw = self.explore_raw(explore_id, recursive, parents, attrs)?;
+        let resp = proto::parse_explore_response(&raw, with_integrity)?;
+        if !resp.header.is_ok() {
+            return Err(Error::protocol(format!(
+                "Explore rejected: return_value=0x{:016x}",
+                resp.header.return_value
+            )));
+        }
+        Ok(resp)
+    }
+
+    /// Diagnostic: Explore `relid` and return a human-readable dump of the returned object
+    /// tree (relid/class/attributes/vartype+varname list sizes). Used to probe live PLC
+    /// behaviour that differs from the PLCSIM captures.
+    pub fn explore_dump(&mut self, relid: u32, recursive: u8, parents: u8) -> Result<String> {
+        self.explore_dump_attrs(relid, recursive, parents, &[])
+    }
+
+    /// Diagnostic: Explore `relid` (recursive) and collect every `Blob` attribute matching
+    /// `attr` across all returned objects, as `(object_relid, bytes)`.
+    pub fn explore_attr_blobs(&mut self, relid: u32, attr: u32) -> Result<Vec<(u32, Vec<u8>)>> {
+        let resp = self.explore(relid, 1, 0, &[attr])?;
+        let mut out = Vec::new();
+        fn scan(obj: &PObject, attr: u32, out: &mut Vec<(u32, Vec<u8>)>) {
+            for (id, v) in &obj.attributes {
+                if *id == attr {
+                    if let PValue::Blob { data, .. } = v {
+                        out.push((obj.relation_id, data.clone()));
+                    }
+                }
+            }
+            for c in &obj.objects {
+                scan(c, attr, out);
+            }
+        }
+        for o in &resp.objects {
+            scan(o, attr, &mut out);
+        }
+        Ok(out)
+    }
+
+    /// Like [`Connection::explore_dump`] but restricts the returned attributes to `attrs`
+    /// (an empty slice returns all). Long attribute values (blobs) are shown as a hex prefix.
+    pub fn explore_dump_attrs(
+        &mut self,
+        relid: u32,
+        recursive: u8,
+        parents: u8,
+        attrs: &[u32],
+    ) -> Result<String> {
+        let resp = self.explore(relid, recursive, parents, attrs)?;
+        let mut out = String::new();
+        fn dump(obj: &PObject, d: usize, out: &mut String) {
+            use std::fmt::Write;
+            let pad = "  ".repeat(d);
+            let _ = writeln!(
+                out,
+                "{pad}obj relid=0x{:08x} class=0x{:08x} attrs={} vartypes={:?} varnames={:?} subs={}",
+                obj.relation_id,
+                obj.class_id,
+                obj.attributes.len(),
+                obj.vartype_list.as_ref().map(|v| v.elements.len()),
+                obj.varname_list.as_ref().map(|v| v.names.len()),
+                obj.objects.len(),
+            );
+            for (id, v) in &obj.attributes {
+                let vs = format!("{v:?}");
+                let vs = if vs.len() > 80 {
+                    format!("{}…", &vs[..80])
+                } else {
+                    vs
+                };
+                let _ = writeln!(out, "{pad}  attr 0x{id:x} ({id}) = {vs}");
+            }
+            if let Some(vt) = &obj.vartype_list {
+                for (i, e) in vt.elements.iter().enumerate() {
+                    let _ = writeln!(
+                        out,
+                        "{pad}  vartype[{i}] lid={} sdt={} crc=0x{:08x} rel={:?}",
+                        e.lid, e.softdatatype, e.symbol_crc, e.offset_info.relation_id
+                    );
+                }
+            }
+            if let Some(vn) = &obj.varname_list {
+                let _ = writeln!(out, "{pad}  varnames={:?}", vn.names);
+            }
+            for (rid, val) in &obj.relations {
+                let _ = writeln!(out, "{pad}  relation 0x{rid:x} -> 0x{val:08x}");
+            }
+            for c in &obj.objects {
+                dump(c, d + 1, out);
+            }
+        }
+        use std::fmt::Write;
+        let _ = writeln!(
+            out,
+            "explore(0x{relid:08x}, rec={recursive}, par={parents}): {} objects",
+            resp.objects.len()
+        );
+        for o in &resp.objects {
+            dump(o, 1, &mut out);
+        }
+        Ok(out)
+    }
+
+    /// Fetch (and cache) the type-info object for `ti_relid` — an Explore of the type, whose
+    /// `VartypeList`/`VarnameList` describe its members.
+    pub fn type_info(&mut self, ti_relid: u32) -> Result<PObject> {
+        if let Some(obj) = self.type_info_cache.get(&ti_relid) {
+            return Ok(obj.clone());
+        }
+        let resp = self.explore(ti_relid, 1, 0, &[])?;
+        // Flatten and cache every returned object that carries a vartype list, keyed by its
+        // own relid.
+        let mut with_types: Vec<PObject> = Vec::new();
+        let mut stack = resp.objects;
+        while let Some(obj) = stack.pop() {
+            stack.extend(obj.objects.iter().cloned());
+            if obj.vartype_list.is_some() {
+                self.type_info_cache.insert(obj.relation_id, obj.clone());
+                with_types.push(obj);
+            }
+        }
+        if let Some(obj) = self.type_info_cache.get(&ti_relid) {
+            return Ok(obj.clone());
+        }
+        // The explored id isn't always the type object's own relid (e.g. controller areas);
+        // fall back to the first object that carries type info.
+        if let Some(obj) = with_types.into_iter().next() {
+            self.type_info_cache.insert(ti_relid, obj.clone());
+            return Ok(obj);
+        }
+        Err(Error::protocol(format!(
+            "type info for relid {ti_relid} carries no member list \
+             (PLC withheld the interface — likely a know-how-protected block)"
+        )))
+    }
+
+    /// Discover (and cache) the data blocks: name, relid, number, and type-info relid.
+    pub fn datablock_list(&mut self) -> Result<Vec<DataBlock>> {
+        if let Some(list) = &self.db_list {
+            return Ok(list.clone());
+        }
+        // DB objects only appear in the Explore when the browse attributes are requested.
+        let resp = self.explore(PLC_PROGRAM_RID, 1, 0, &BROWSE_ATTRS)?;
+        let mut dbs = Vec::new();
+        for program in &resp.objects {
+            for ob in &program.objects {
+                if ob.class_id == DB_CLASS_RID && (ob.relation_id >> 16) == 0x8a0e {
+                    let name = ob
+                        .attributes
+                        .iter()
+                        .find_map(|(id, v)| match (id, v) {
+                            (&OBJECT_VARIABLE_TYPE_NAME, PValue::WString(s)) => Some(s.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    dbs.push(DataBlock {
+                        name,
+                        relid: ob.relation_id,
+                        number: ob.relation_id & 0xffff,
+                        ti_relid: 0,
+                    });
+                }
+            }
+        }
+        // Reading LID=1 of a DB returns its type-info relid.
+        for db in &mut dbs {
+            let addr = ItemAddress {
+                symbol_crc: 0,
+                access_area: db.relid,
+                access_sub_area: DB_VALUE_ACTUAL,
+                lid: vec![1],
+            };
+            let r = self.read_variables(&[addr])?;
+            if let Some(PValue::RID(ti)) = r.value(1) {
+                db.ti_relid = *ti;
+            }
+        }
+        dbs.retain(|d| d.ti_relid != 0);
+        self.db_list = Some(dbs.clone());
+        Ok(dbs)
+    }
+
+    /// Fetch the OMS type-info container in one (multi-fragment) Explore and cache every type
+    /// object that carries a member list, keyed by relation id. This is the canonical, bulk
+    /// source of type info the reference uses for browsing (`ObjectOMSTypeInfoContainer`): one
+    /// round-trip for the whole program instead of a per-type Explore, and complete for large
+    /// programs. Best-effort — [`Connection::type_info`] still falls back to a per-type Explore
+    /// on a cache miss.
+    pub fn prefetch_type_container(&mut self) -> Result<()> {
+        let resp = self.explore(OMS_TYPE_INFO_CONTAINER_RID, 1, 0, &[])?;
+        let mut stack: Vec<PObject> = resp.objects;
+        while let Some(obj) = stack.pop() {
+            for child in &obj.objects {
+                stack.push(child.clone());
+            }
+            if obj.vartype_list.is_some() {
+                let rid = obj.relation_id;
+                self.type_info_cache.entry(rid).or_insert(obj);
+            }
+        }
+        Ok(())
+    }
+
+    /// Enumerate every readable leaf variable in the whole PLC program (all data blocks plus the
+    /// M/Q/I areas) as a flat [`VarInfo`] list, descending into nested structs/FBs and expanding
+    /// arrays (including arrays of structs) to their elements. Bulk-prefetches the type container
+    /// first. Blocks whose interface the PLC withholds (know-how protected) contribute nothing.
+    pub fn browse_vars(&mut self) -> Result<Vec<VarInfo>> {
+        let dbs = self.datablock_list()?;
+        let _ = self.prefetch_type_container(); // best effort
+        let mut out = Vec::new();
+        for db in dbs {
+            let _ = self.walk_type(
+                db.relid,
+                DB_VALUE_ACTUAL,
+                db.ti_relid,
+                &db.name,
+                &[],
+                0,
+                &mut out,
+            );
+        }
+        for (rid, ti, _label) in CONTROLLER_AREAS {
+            let _ = self.walk_type(rid, CONTROLLER_AREA_VALUE_ACTUAL, ti, "", &[], 0, &mut out);
+        }
+        Ok(out)
+    }
+
+    /// Enumerate the readable leaf variables of one data block (name prefixed by the DB name).
+    pub fn browse_datablock(
+        &mut self,
+        db_relid: u32,
+        ti_relid: u32,
+        name: &str,
+    ) -> Result<Vec<VarInfo>> {
+        let mut out = Vec::new();
+        self.walk_type(db_relid, DB_VALUE_ACTUAL, ti_relid, name, &[], 0, &mut out)?;
+        Ok(out)
+    }
+
+    /// Enumerate the readable leaf variables of one controller area (M/Q/I; bare tag names).
+    pub fn browse_controller_area(&mut self, area_rid: u32, ti_relid: u32) -> Result<Vec<VarInfo>> {
+        let mut out = Vec::new();
+        self.walk_type(
+            area_rid,
+            CONTROLLER_AREA_VALUE_ACTUAL,
+            ti_relid,
+            "",
+            &[],
+            0,
+            &mut out,
+        )?;
+        Ok(out)
+    }
+
+    /// Recursively enumerate the members of the type at `ti_relid`, appending a [`VarInfo`] leaf
+    /// for every scalar/string element. Mirrors the reference `Browser.AddSubNodes` +
+    /// `BuildFlatList` walk, but keeps only the symbolic LID access sequence (byte offsets are for
+    /// non-optimized access, which we don't do). `lids` is the access sequence so far.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_type(
+        &mut self,
+        area: u32,
+        sub_area: u32,
+        ti_relid: u32,
+        prefix: &str,
+        lids: &[u32],
+        depth: usize,
+        out: &mut Vec<VarInfo>,
+    ) -> Result<()> {
+        if depth > MAX_BROWSE_DEPTH {
+            return Ok(());
+        }
+        let ti = self.type_info(ti_relid)?;
+        let (Some(names), Some(types)) = (&ti.varname_list, &ti.vartype_list) else {
+            return Ok(()); // no member list (empty area, or interface withheld)
+        };
+        // Clone the member descriptors so we can recurse (which needs &mut self) without holding
+        // a borrow of the cache.
+        let members: Vec<(String, crate::proto::VartypeElement)> = names
+            .names
+            .iter()
+            .cloned()
+            .zip(types.elements.iter().cloned())
+            .collect();
+        for (mname, elem) in members {
+            let oi = &elem.offset_info;
+            let name = if prefix.is_empty() {
+                mname.clone()
+            } else {
+                format!("{prefix}.{mname}")
+            };
+            let mut base = lids.to_vec();
+            base.push(elem.lid);
+            let sdt = elem.softdatatype;
+            let has_rel = oi.has_relation();
+
+            if oi.is_1dim || oi.is_mdim {
+                // Enumerate array elements: `(display suffix, zero-based element id)`.
+                let elems: Vec<(String, u32)> = if oi.is_1dim {
+                    let lower = oi.array_lower_bounds;
+                    (0..oi.array_element_count)
+                        .map(|k| (format!("[{}]", lower + k as i32), k))
+                        .collect()
+                } else {
+                    mdim_elements(oi, sdt)
+                };
+                for (suffix, id) in elems {
+                    let ename = format!("{name}{suffix}");
+                    let mut elids = base.clone();
+                    elids.push(id);
+                    if has_rel {
+                        elids.push(1); // struct-array: extra id between index and member LID
+                        if let Some(rel) = oi.relation_id {
+                            self.walk_type(area, sub_area, rel, &ename, &elids, depth + 1, out)?;
+                        }
+                    } else {
+                        out.push(VarInfo {
+                            name: ename,
+                            access_area: area,
+                            access_sub_area: sub_area,
+                            lids: elids,
+                            softdatatype: sdt,
+                            string_max_len: oi.string_max_len,
+                        });
+                    }
+                }
+            } else if has_rel {
+                // Nested struct / FB / system-library type (IEC_TIMER, DTL, …): descend.
+                if let Some(rel) = oi.relation_id {
+                    self.walk_type(area, sub_area, rel, &name, &base, depth + 1, out)?;
+                }
+            } else {
+                out.push(VarInfo {
+                    name,
+                    access_area: area,
+                    access_sub_area: sub_area,
+                    lids: base,
+                    softdatatype: sdt,
+                    string_max_len: oi.string_max_len,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Read the current values of browsed variables in batched `GetMultiVariables` requests.
+    /// Returns one entry per input var (in order): `Some(value)` if read, `None` if that item
+    /// genuinely errored on the PLC. A whole batch failing propagates as `Err`.
+    ///
+    /// A batch whose items *all* come back errored is treated as "the PLC refused a batch this
+    /// large" and is retried in halves down to single items — so a per-request item cap degrades
+    /// to correct (if slower) reads rather than spurious "not readable" results.
+    pub fn read_var_values(&mut self, vars: &[VarInfo]) -> Result<Vec<Option<PValue>>> {
+        let batch = std::env::var("S7_READ_BATCH")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(READ_BATCH);
+        let mut out = Vec::with_capacity(vars.len());
+        for chunk in vars.chunks(batch) {
+            self.read_chunk_adaptive(chunk, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    /// Read one chunk, tolerating a PLC per-request cap: an over-large batch is refused either as
+    /// a header-level rejection (`Err`) or as every item erroring — in both cases (when the chunk
+    /// has more than one item) we split in half and retry. A genuinely unreadable *single* item
+    /// becomes `None` rather than aborting the whole read; only a lost connection propagates.
+    fn read_chunk_adaptive(
+        &mut self,
+        chunk: &[VarInfo],
+        out: &mut Vec<Option<PValue>>,
+    ) -> Result<()> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        let addrs: Vec<ItemAddress> = chunk.iter().map(VarInfo::address).collect();
+        match self.read_variables(&addrs) {
+            Ok(resp) => {
+                let vals: Vec<Option<PValue>> = (0..chunk.len())
+                    .map(|i| resp.value((i + 1) as u32).cloned())
+                    .collect();
+                if chunk.len() > 1 && vals.iter().all(Option::is_none) {
+                    self.split_and_read(chunk, out)
+                } else {
+                    out.extend(vals);
+                    Ok(())
+                }
+            }
+            // A real transport loss must propagate; a protocol rejection of an over-cap batch is
+            // recoverable by splitting. A single item that still fails is recorded as `None`.
+            Err(e) if e.is_connection_lost() => Err(e),
+            Err(_) if chunk.len() > 1 => self.split_and_read(chunk, out),
+            Err(_) => {
+                out.push(None);
+                Ok(())
+            }
+        }
+    }
+
+    /// Split a chunk in half and read each half (used by the adaptive read to back off an
+    /// over-large batch).
+    fn split_and_read(&mut self, chunk: &[VarInfo], out: &mut Vec<Option<PValue>>) -> Result<()> {
+        let mid = chunk.len() / 2;
+        self.read_chunk_adaptive(&chunk[..mid], out)?;
+        self.read_chunk_adaptive(&chunk[mid..], out)
+    }
+
+    /// Resolve a symbol like `"Data_block_1.toto"` to its [`ItemAddress`] by walking the
+    /// block's type info. Handles nested structs/FBs and 1-D/M-D array indexing
+    /// (`"DB.arr[2]"`, `"DB.m[1,2]"`).
+    pub fn resolve_symbol(&mut self, symbol: &str) -> Result<ItemAddress> {
+        Ok(self.resolve_full(symbol)?.0)
+    }
+
+    /// Like [`Connection::resolve_symbol`] but also returns the resolved leaf member's
+    /// type-info element (datatype, string max length, …).
+    fn resolve_full(
+        &mut self,
+        symbol: &str,
+    ) -> Result<(ItemAddress, Option<crate::proto::VartypeElement>)> {
+        let levels: Vec<&str> = symbol.split('.').collect();
+        let first = parse_level(levels.first().copied().unwrap_or("")).0;
+
+        // Determine the access root. A data block consumes the first path level (the DB
+        // name); a controller area (M/Q/I) does not — the first level is already a tag in it.
+        let dbs = self.datablock_list()?;
+        let (access_area, access_sub_area, root_ti, start) =
+            if let Some(db) = dbs.iter().find(|d| d.name == first).cloned() {
+                (db.relid, DB_VALUE_ACTUAL, db.ti_relid, 1usize)
+            } else {
+                let mut found = None;
+                for (rid, ti, _label) in CONTROLLER_AREAS {
+                    let info = self.type_info(ti)?;
+                    let present = info
+                        .varname_list
+                        .as_ref()
+                        .is_some_and(|n| n.names.iter().any(|name| name == first));
+                    if present {
+                        found = Some((rid, CONTROLLER_AREA_VALUE_ACTUAL, ti, 0usize));
+                        break;
+                    }
+                }
+                found.ok_or_else(|| {
+                    Error::protocol(format!(
+                        "symbol '{symbol}' not found in any data block or M/Q/I area"
+                    ))
+                })?
+            };
+
+        let mut addr = ItemAddress {
+            symbol_crc: 0,
+            access_area,
+            access_sub_area,
+            lid: Vec::new(),
+        };
+        let mut ti_relid = root_ti;
+        let mut leaf: Option<crate::proto::VartypeElement> = None;
+        let mut i = start;
+        while i < levels.len() {
+            let (name, indices) = parse_level(levels[i]);
+            let ti = self.type_info(ti_relid)?;
+            let names = ti
+                .varname_list
+                .as_ref()
+                .ok_or_else(|| Error::protocol("type info missing VarnameList"))?;
+            let vt = ti
+                .vartype_list
+                .as_ref()
+                .ok_or_else(|| Error::protocol("type info missing VartypeList"))?;
+            let idx = names
+                .names
+                .iter()
+                .position(|n| n == name)
+                .ok_or_else(|| Error::protocol(format!("member '{name}' not found")))?;
+            let elem = vt
+                .elements
+                .get(idx)
+                .ok_or_else(|| Error::protocol("VartypeList shorter than VarnameList"))?
+                .clone();
+            let oi = &elem.offset_info;
+            addr.lid.push(elem.lid);
+
+            // Array indexing: append the (zero-based, row-major) element id, plus an extra
+            // `.1` when the elements are structs (array-of-struct).
+            if !indices.is_empty() {
+                let array_lid = array_element_id(oi, &indices)
+                    .ok_or_else(|| Error::protocol(format!("bad array index for '{name}'")))?;
+                addr.lid.push(array_lid);
+                if oi.has_relation() {
+                    addr.lid.push(1);
+                }
+            } else if (oi.is_1dim || oi.is_mdim) && oi.has_relation() {
+                // A bare array-of-struct name without `[..]` (whole-array read) — unsupported.
+                return Err(Error::protocol(format!(
+                    "whole array-of-struct read of '{name}' not supported; index it"
+                )));
+            }
+
+            let relation_id = oi.relation_id;
+            leaf = Some(elem);
+            i += 1;
+            match relation_id {
+                // Descend into a nested struct/FB for the next path level.
+                Some(rel) if i < levels.len() => ti_relid = rel,
+                _ => break,
+            }
+        }
+        if i < levels.len() {
+            return Err(Error::protocol(format!(
+                "could not fully resolve '{symbol}' (stopped before '{}')",
+                levels[i]
+            )));
+        }
+        Ok((addr, leaf))
+    }
+
+    /// Read a single tag by symbol name (e.g. `"Data_block_1.toto"`).
+    pub fn read_tag(&mut self, symbol: &str) -> Result<PValue> {
+        let addr = self.resolve_symbol(symbol)?;
+        let resp = self.read_variables(&[addr])?;
+        if let Some(v) = resp.value(1) {
+            Ok(v.clone())
+        } else if let Some((_, e)) = resp.errors.first() {
+            Err(Error::protocol(format!(
+                "read '{symbol}' returned error 0x{e:016x}"
+            )))
+        } else {
+            Err(Error::protocol(format!(
+                "read '{symbol}' returned no value"
+            )))
+        }
+    }
+
+    /// Write a single tag by symbol name (e.g. `"Data_block_1.titi"`). The `value` type must
+    /// match the PLC variable's type.
+    pub fn write_tag(&mut self, symbol: &str, value: PValue) -> Result<()> {
+        let addr = self.resolve_symbol(symbol)?;
+        let resp = self.write_variables(&[addr], &[value])?;
+        if let Some((item, e)) = resp.errors.first() {
+            return Err(Error::protocol(format!(
+                "write '{symbol}' rejected: item {item} return_value=0x{e:016x}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Read several tags by name in one `GetMultiVariables` round-trip. Returns one result per
+    /// symbol, in order; a per-item failure is `Err` for that entry (the others still succeed).
+    /// More efficient than repeated [`Connection::read_tag`] for a known set of tags.
+    pub fn read_tags(&mut self, symbols: &[&str]) -> Result<Vec<Result<PValue>>> {
+        let mut addrs = Vec::with_capacity(symbols.len());
+        for s in symbols {
+            addrs.push(self.resolve_symbol(s)?);
+        }
+        let resp = self.read_variables(&addrs)?;
+        Ok(symbols
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let item = (i + 1) as u32;
+                resp.value(item).cloned().ok_or_else(|| {
+                    let code = resp
+                        .errors
+                        .iter()
+                        .find(|(it, _)| *it == item)
+                        .map(|(_, e)| *e)
+                        .unwrap_or(0);
+                    Error::protocol(format!("read '{s}' failed (return_value=0x{code:016x})"))
+                })
+            })
+            .collect())
+    }
+
+    /// Write several tags by name in one `SetMultiVariables` round-trip (paired by position). The
+    /// value type must match each PLC variable. Errors if any item is rejected, naming the first.
+    pub fn write_tags(&mut self, pairs: &[(&str, PValue)]) -> Result<()> {
+        let mut addrs = Vec::with_capacity(pairs.len());
+        let mut values = Vec::with_capacity(pairs.len());
+        for (name, value) in pairs {
+            addrs.push(self.resolve_symbol(name)?);
+            values.push(value.clone());
+        }
+        let resp = self.write_variables(&addrs, &values)?;
+        if let Some((item, e)) = resp.errors.first() {
+            let name = pairs
+                .get((*item as usize).wrapping_sub(1))
+                .map(|(n, _)| *n)
+                .unwrap_or("?");
+            return Err(Error::protocol(format!(
+                "write '{name}' rejected: item {item} return_value=0x{e:016x}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Read an S7 `STRING` tag by name. On the wire a STRING is a USInt array
+    /// `[max_len, actual_len, chars…]` in ISO-8859-1; this decodes it to a Rust `String`.
+    pub fn read_string(&mut self, symbol: &str) -> Result<String> {
+        match self.read_tag(symbol)? {
+            PValue::USIntArray(bytes) => Ok(decode_s7_string(&bytes)),
+            other => Err(Error::protocol(format!(
+                "'{symbol}' did not read back as a STRING (got {other:?})"
+            ))),
+        }
+    }
+
+    /// Write an S7 `STRING` tag by name. The variable's declared max length (from its type
+    /// info) frames the written buffer; characters outside ISO-8859-1 become `?`.
+    pub fn write_string(&mut self, symbol: &str, value: &str) -> Result<()> {
+        let (addr, leaf) = self.resolve_full(symbol)?;
+        let max_len = leaf
+            .as_ref()
+            .map(|e| e.offset_info.string_max_len)
+            .filter(|&m| m > 0)
+            .unwrap_or(254)
+            .min(254) as u8;
+        let payload = encode_s7_string(value, max_len);
+        let resp = self.write_variables(&[addr], &[PValue::USIntArray(payload)])?;
+        if let Some((item, e)) = resp.errors.first() {
+            return Err(Error::protocol(format!(
+                "write '{symbol}' rejected: item {item} return_value=0x{e:016x}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Read the session's effective protection level (`EffectiveProtectionLevel`). `1` means
+    /// full access (no legitimation needed); higher values mean access is restricted until
+    /// [`Connection::legitimate`] succeeds.
+    pub fn effective_protection_level(&mut self) -> Result<u32> {
+        let resp = self.get_var_substreamed(ids::EFFECTIVE_PROTECTION_LEVEL)?;
+        if !resp.header.is_ok() {
+            return Err(Error::protocol(format!(
+                "reading protection level rejected: return_value=0x{:016x}",
+                resp.header.return_value
+            )));
+        }
+        match resp.value {
+            PValue::UDInt(v) => Ok(v),
+            other => Err(Error::protocol(format!(
+                "unexpected protection-level value type: {other:?}"
+            ))),
+        }
+    }
+
+    /// Authenticate (the "new", firmware ≥ V3.1 path): fetch the server-session challenge,
+    /// AES-encrypt the credentials payload with the exported keying material, and submit it.
+    pub fn legitimate(&mut self, username: &str, password: &str) -> Result<()> {
+        // 1. Fetch the challenge.
+        let challenge_resp = self.get_var_substreamed(ids::SERVER_SESSION_REQUEST)?;
+        if !challenge_resp.header.is_ok() {
+            return Err(Error::protocol(format!(
+                "challenge request rejected: return_value=0x{:016x}",
+                challenge_resp.header.return_value
+            )));
+        }
+        let challenge = match challenge_resp.value {
+            PValue::USIntArray(bytes) => bytes,
+            other => {
+                return Err(Error::protocol(format!(
+                    "unexpected challenge value type: {other:?}"
+                )))
+            }
+        };
+        if challenge.len() < crypto::AES_BLOCK_LEN {
+            return Err(Error::protocol("challenge shorter than one AES block"));
+        }
+
+        // 2. Derive key/IV and encrypt the credentials payload.
+        let secret = self.export_oms_secret()?;
+        let key = crypto::sha256(&secret);
+        let iv = &challenge[..crypto::AES_BLOCK_LEN];
+        let mut payload = Vec::new();
+        build_legitimation_payload(username, password).serialize(&mut payload)?;
+        let ciphertext = crypto::encrypt_aes256_cbc_pkcs7(&key, iv, &payload)?;
+
+        // 3. Submit the encrypted response.
+        let resp = self.set_variable(
+            ids::LEGITIMATE,
+            &PValue::Blob {
+                root_id: 0,
+                data: ciphertext,
+            },
+        )?;
+        // Denied if the error bit is set OR the low 16 bits (as a signed int) are negative —
+        // the reference treats `(Int16)ReturnValue < 0` as access-denied.
+        let rv = resp.header.return_value;
+        if !resp.header.is_ok() || (rv as i16) < 0 {
+            return Err(Error::protocol(format!(
+                "legitimation rejected (access denied): return_value=0x{rv:016x}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Send a framed request telegram and read the next response telegram. Uses TLS, or — for a
+    /// legacy connection — the ProtocolVersion-0x03 per-PDU HMAC digest framing over plain COTP.
+    pub fn request_response(&mut self, framed_request: &[u8]) -> Result<Vec<u8>> {
+        if self.poisoned {
+            return Err(Error::closed(
+                "connection poisoned by an earlier transport failure; reconnect required",
+            ));
+        }
+        // Any failure here leaves the sequence/integrity-id counters out of sync with the PLC,
+        // so the connection can no longer be reused. Poison it and surface the error.
+        let result = self.request_response_inner(framed_request);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn request_response_inner(&mut self, framed_request: &[u8]) -> Result<Vec<u8>> {
+        if let Some(key) = self.legacy_session_key {
+            let v3 = crate::legacy::session::frame_v3(&key, framed_request)?;
+            self.tcp.send_iso_packet(&v3)?;
+        } else {
+            self.tls
+                .as_mut()
+                .ok_or_else(|| Error::protocol("no TLS channel on a non-legacy connection"))?
+                .send(&mut self.tcp, framed_request)?;
+        }
+        self.recv_response()
+    }
+
+    /// Receive the next telegram for the active transport (TLS, or legacy V3-digest framing).
+    fn recv_one_telegram(&mut self) -> Result<Vec<u8>> {
+        if self.legacy_session_key.is_some() {
+            crate::legacy::session::recv_and_strip(&mut self.tcp)
+        } else {
+            self.recv_telegram()
+        }
+    }
+
+    /// Handle a `SystemEvent` (`0xfe`) keep-alive: `Ok(true)` if it was one (and non-fatal, so skip
+    /// it), `Ok(false)` if `bytes` is not a SystemEvent, `Err` if it was a fatal one.
+    fn skip_if_system_event(&self, bytes: &[u8]) -> Result<bool> {
+        if !proto::is_system_event(bytes) {
+            return Ok(false);
+        }
+        let ev = proto::parse_system_event(bytes)?;
+        if ev.is_fatal() {
+            return Err(Error::protocol(
+                "PLC sent a fatal SystemEvent; connection must be re-established",
+            ));
+        }
+        log::debug!(
+            "skipping SystemEvent keep-alive (confirmed_bytes={})",
+            ev.confirmed_bytes
+        );
+        Ok(true)
+    }
+
+    /// Receive the next **response** telegram. Skips `SystemEvent` keep-alives and buffers any
+    /// `Notification` telegrams (an active subscription pushes them asynchronously between our
+    /// request/response exchanges) for later delivery via [`Connection::next_notification`].
+    fn recv_response(&mut self) -> Result<Vec<u8>> {
+        loop {
+            let bytes = self.recv_one_telegram()?;
+            if self.skip_if_system_event(&bytes)? {
+                continue;
+            }
+            if is_notification_telegram(&bytes) {
+                self.pending_notifications.push_back(bytes);
+                continue;
+            }
+            return Ok(bytes);
+        }
+    }
+
+    /// Receive the next **notification** telegram (skipping `SystemEvent` keep-alives).
+    fn recv_notification_telegram(&mut self) -> Result<Vec<u8>> {
+        loop {
+            let bytes = self.recv_one_telegram()?;
+            if self.skip_if_system_event(&bytes)? {
+                continue;
+            }
+            return Ok(bytes);
+        }
+    }
+
+    /// Read one complete S7CommPlus telegram from the encrypted stream, reassembling the
+    /// multi-chunk framing (each chunk a `72 ver len` header; the telegram ends at the
+    /// `72 ver 00 00` trailer). Returns the telegram re-wrapped as a single framed PDU so
+    /// the `proto::parse_*` helpers can consume it directly.
+    fn recv_telegram(&mut self) -> Result<Vec<u8>> {
+        let mut data = Vec::new();
+        let version: u8;
+        loop {
+            self.fill(4)?;
+            let header = self.take(4);
+            if header[0] != pdu::PROTOCOL_ID {
+                return Err(Error::protocol(format!(
+                    "bad S7CommPlus chunk header byte 0x{:02x}",
+                    header[0]
+                )));
+            }
+            let len = u16::from_be_bytes([header[2], header[3]]) as usize;
+            if len == 0 {
+                version = header[1]; // trailer => end of telegram
+                break;
+            }
+            self.fill(len)?;
+            let chunk = self.take(len);
+            data.extend_from_slice(&chunk);
+        }
+        Ok(pdu::frame_single_pdu(version, &data))
+    }
+
+    /// Ensure at least `n` unconsumed bytes are buffered, pumping the TLS channel as needed.
+    fn fill(&mut self, n: usize) -> Result<()> {
+        while self.rbuf.len() - self.rpos < n {
+            let chunk = self
+                .tls
+                .as_mut()
+                .ok_or_else(|| Error::protocol("no TLS channel on a non-legacy connection"))?
+                .recv(&mut self.tcp)?;
+            if chunk.is_empty() {
+                return Err(Error::framing("TLS stream closed mid-telegram"));
+            }
+            self.rbuf.extend_from_slice(&chunk);
+        }
+        Ok(())
+    }
+
+    /// Remove and return the next `n` buffered bytes (caller must have `fill`ed first). Advances a
+    /// read cursor instead of shifting the buffer; the buffer is cleared once fully consumed, so a
+    /// large multi-chunk telegram is deframed in O(size) rather than O(size²).
+    fn take(&mut self, n: usize) -> Vec<u8> {
+        let out = self.rbuf[self.rpos..self.rpos + n].to_vec();
+        self.rpos += n;
+        if self.rpos == self.rbuf.len() {
+            self.rbuf.clear();
+            self.rpos = 0;
+        }
+        out
+    }
+}
+
+/// True if a framed telegram's opcode is a `Notification` (`0x33`).
+fn is_notification_telegram(buf: &[u8]) -> bool {
+    pdu::parse_header(buf)
+        .ok()
+        .and_then(|h| buf.get(h.body_offset).copied())
+        .map(|op| op == pdu::opcode::NOTIFICATION)
+        .unwrap_or(false)
+}
+
+/// Split a symbol path level into its name and any array indices: `arr[2]` → `("arr", [2])`,
+/// `m[1,2]` → `("m", [1, 2])`, `field` → `("field", [])`.
+fn parse_level(level: &str) -> (&str, Vec<i32>) {
+    match level.find('[') {
+        Some(open) => {
+            let name = &level[..open];
+            let close = level[open..]
+                .find(']')
+                .map(|c| open + c)
+                .unwrap_or(level.len());
+            let inner = &level[open + 1..close];
+            let indices = inner
+                .split(',')
+                .filter_map(|x| x.trim().parse::<i32>().ok())
+                .collect();
+            (name, indices)
+        }
+        None => (level, Vec::new()),
+    }
+}
+
+/// Compute the zero-based, row-major element id for an array access (the LID appended for
+/// `[..]`), porting the reference's 1-dim and M-dim access-sequence math. Returns `None` on
+/// a dimension/bounds mismatch.
+#[allow(clippy::needless_range_loop)]
+fn array_element_id(oi: &crate::proto::OffsetInfo, indices: &[i32]) -> Option<u32> {
+    if oi.is_1dim {
+        if indices.len() != 1 {
+            return None;
+        }
+        let zero = indices[0].checked_sub(oi.array_lower_bounds)?;
+        if zero < 0 || (zero as u32) > oi.array_element_count {
+            return None;
+        }
+        Some(zero as u32)
+    } else if oi.is_mdim {
+        let dim_count = oi.mdim_element_count.iter().filter(|&&c| c > 0).count();
+        if dim_count == 0 || dim_count != indices.len() {
+            return None;
+        }
+        // Normalize indices against the (reversed) per-dimension lower bounds.
+        let mut idx = vec![0i64; dim_count];
+        for i in 0..dim_count {
+            let lb = oi.mdim_lower_bounds[dim_count - i - 1];
+            let v = indices[i].checked_sub(lb)?;
+            if v < 0 || (v as u32) > oi.mdim_element_count[dim_count - i - 1] {
+                return None;
+            }
+            idx[i] = v as i64;
+        }
+        // Row-major strides.
+        let mut dim_size = vec![1u64; dim_count];
+        let mut g = 1u64;
+        for i in 0..dim_count - 1 {
+            dim_size[i] = g;
+            g *= oi.mdim_element_count[i] as u64;
+        }
+        dim_size[dim_count - 1] = g;
+        let mut array_index = 0i64;
+        for i in 0..dim_count {
+            array_index += idx[i] * dim_size[dim_count - i - 1] as i64;
+        }
+        u32::try_from(array_index).ok()
+    } else {
+        None
+    }
+}
+
+/// Enumerate the elements of an M-dimensional array as `(display suffix, zero-based access id)`,
+/// porting the reference `Browser.AddSubNodes` M-dim loop (dimension 0 varies fastest; names list
+/// the dimensions high-to-low; `BBOOL` arrays skip ids to the next byte boundary per row).
+fn mdim_elements(oi: &crate::proto::OffsetInfo, softdatatype: u8) -> Vec<(String, u32)> {
+    let actdim = oi.mdim_element_count.iter().filter(|&&c| c > 0).count();
+    if actdim == 0 {
+        return Vec::new();
+    }
+    let total = oi.array_element_count;
+    let mut out = Vec::new();
+    let mut xx = [0u32; 6];
+    let mut id = 0u32;
+    let mut n = 1u32;
+    loop {
+        let mut name = String::from("[");
+        for j in (0..actdim).rev() {
+            let v = xx[j] as i64 + oi.mdim_lower_bounds[j] as i64;
+            name.push_str(&v.to_string());
+            name.push(if j > 0 { ',' } else { ']' });
+        }
+        out.push((name, id));
+
+        xx[0] += 1;
+        // BBOOL arrays: the id of the fastest dimension only advances in units up to 8 per byte.
+        if softdatatype == SDT_BBOOL
+            && xx[0] >= oi.mdim_element_count[0]
+            && oi.mdim_element_count[0] % 8 != 0
+        {
+            id += 8 - (xx[0] % 8);
+        }
+        for dim in 0..5 {
+            if xx[dim] >= oi.mdim_element_count[dim] {
+                xx[dim] = 0;
+                xx[dim + 1] += 1;
+            }
+        }
+        id += 1;
+        n += 1;
+        if n > total {
+            break;
+        }
+    }
+    out
+}
+
+/// Decode an S7 `STRING` from its USInt-array form `[max_len, actual_len, chars…]` (Latin-1).
+fn decode_s7_string(bytes: &[u8]) -> String {
+    if bytes.len() < 2 {
+        return String::new();
+    }
+    let act_len = bytes[1] as usize;
+    let end = (2 + act_len).min(bytes.len());
+    bytes[2..end].iter().map(|&b| b as char).collect()
+}
+
+/// Encode an S7 `STRING` to its USInt-array write form: `[max_len, actual_len, chars…]`
+/// padded to `max_len + 2` bytes (Latin-1; non-Latin-1 chars become `?`).
+fn encode_s7_string(value: &str, max_len: u8) -> Vec<u8> {
+    let chars: Vec<u8> = value
+        .chars()
+        .map(|c| if (c as u32) <= 0xff { c as u8 } else { b'?' })
+        .collect();
+    let act = chars.len().min(max_len as usize);
+    let mut out = vec![0u8; max_len as usize + 2];
+    out[0] = max_len;
+    out[1] = act as u8;
+    out[2..2 + act].copy_from_slice(&chars[..act]);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::OffsetInfo;
+
+    #[test]
+    fn parse_level_handles_names_and_indices() {
+        assert_eq!(parse_level("toto"), ("toto", vec![]));
+        assert_eq!(parse_level("arr[2]"), ("arr", vec![2]));
+        assert_eq!(parse_level("m[1,2]"), ("m", vec![1, 2]));
+        assert_eq!(parse_level("a[ -3 ]"), ("a", vec![-3]));
+    }
+
+    #[test]
+    fn array_element_id_1dim() {
+        // Array[1..10] -> index 3 maps to element id 2.
+        let oi = OffsetInfo {
+            is_1dim: true,
+            array_lower_bounds: 1,
+            array_element_count: 10,
+            ..Default::default()
+        };
+        assert_eq!(array_element_id(&oi, &[3]), Some(2));
+        assert_eq!(array_element_id(&oi, &[1]), Some(0));
+        assert_eq!(array_element_id(&oi, &[0]), None); // below lower bound
+        assert_eq!(array_element_id(&oi, &[1, 2]), None); // wrong dim count
+    }
+
+    #[test]
+    fn array_element_id_2dim() {
+        // Counts {3,4}; element [1,2] per the reference formula:
+        //   indexes=[1,2], dimSize=[1,3] -> 1*dimSize[1] + 2*dimSize[0] = 1*3 + 2*1 = 5.
+        let mut oi = OffsetInfo {
+            is_mdim: true,
+            ..Default::default()
+        };
+        oi.mdim_element_count[0] = 3;
+        oi.mdim_element_count[1] = 4;
+        assert_eq!(array_element_id(&oi, &[1, 2]), Some(5));
+        assert_eq!(array_element_id(&oi, &[0, 0]), Some(0));
+    }
+
+    #[test]
+    fn mdim_elements_2d_enumeration() {
+        // A 2-D array with dim0 count=2 (fastest), dim1 count=3, lower bounds 0. The reference
+        // loop enumerates a linear access id (dim0 varies fastest) and names the dimensions
+        // high-to-low, so the rightmost index is the fastest-varying.
+        let oi = OffsetInfo {
+            is_mdim: true,
+            array_element_count: 6,
+            mdim_element_count: [2, 3, 0, 0, 0, 0],
+            mdim_lower_bounds: [0, 0, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        let got = mdim_elements(&oi, 7 /* DInt softdatatype, not BBOOL */);
+        assert_eq!(
+            got,
+            vec![
+                ("[0,0]".into(), 0),
+                ("[0,1]".into(), 1),
+                ("[1,0]".into(), 2),
+                ("[1,1]".into(), 3),
+                ("[2,0]".into(), 4),
+                ("[2,1]".into(), 5),
+            ]
+        );
+    }
+
+    #[test]
+    fn mdim_elements_honours_lower_bounds() {
+        // Non-zero lower bounds shift the displayed indices but not the access ids.
+        let oi = OffsetInfo {
+            is_mdim: true,
+            array_element_count: 4,
+            mdim_element_count: [2, 2, 0, 0, 0, 0],
+            mdim_lower_bounds: [1, 10, 0, 0, 0, 0],
+            ..Default::default()
+        };
+        let got = mdim_elements(&oi, 7 /* DInt softdatatype, not BBOOL */);
+        assert_eq!(
+            got,
+            vec![
+                ("[10,1]".into(), 0),
+                ("[10,2]".into(), 1),
+                ("[11,1]".into(), 2),
+                ("[11,2]".into(), 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn s7_string_roundtrip() {
+        let encoded = encode_s7_string("Hello", 254);
+        assert_eq!(encoded.len(), 256);
+        assert_eq!(encoded[0], 254); // max len
+        assert_eq!(encoded[1], 5); // actual len
+        assert_eq!(&encoded[2..7], b"Hello");
+        assert_eq!(decode_s7_string(&encoded), "Hello");
+        // Truncation to max length.
+        let short = encode_s7_string("abcdef", 3);
+        assert_eq!(short, vec![3, 3, b'a', b'b', b'c']);
+        assert_eq!(decode_s7_string(&short), "abc");
+    }
+}

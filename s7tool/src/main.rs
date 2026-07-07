@@ -1,0 +1,810 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// Copyright (C) 2026 s7commplus-rs contributors
+//
+// s7tool — a minimal CLI built *on top of* the `s7commplus` crate, to exercise the driver
+// against a live PLC: browse the symbol tree, read tags by name, and write them back.
+//
+// It lives in its own crate (depending on `s7commplus` by path) precisely to show the
+// driver being consumed as an ordinary library dependency — copy this `src/` + the dep
+// line in `Cargo.toml` into your own app and you have a working starting point.
+//
+//   s7tool --ip 192.168.0.1                          # interactive prompt
+//   s7tool --ip 192.168.0.1 browse                   # one-shot: dump every tag + value
+//   s7tool --ip 192.168.0.1 read Data_block_1.toto   # one-shot: read by symbol
+//   s7tool --ip 192.168.0.1 write Data_block_1.titi 456
+//   S7_PLC_IP=192.168.0.1 s7tool                     # IP/port may also come from env
+
+use std::io::{self, Write};
+use std::time::Duration;
+
+use s7commplus::value::{datetime, PValue};
+use s7commplus::{Connection, Error, Result, SubscriptionItem, VarInfo};
+
+const PROMPT: &str = "s7> ";
+
+fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    let cfg = match Config::from_args() {
+        Ok(cfg) => cfg,
+        Err(msg) => {
+            eprintln!("s7tool: {msg}\n");
+            print_usage();
+            std::process::exit(2);
+        }
+    };
+    if let Err(e) = run(cfg) {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// Connection target plus the (possibly empty) one-shot command.
+struct Config {
+    ip: String,
+    port: u16,
+    /// Use the legacy (pre-TLS, FW < 2.9) PLCSIM (`03:`) transport instead of TLS.
+    legacy: bool,
+    /// Use the legacy real-hardware (`00:`/`01:`) transport, auto-detecting family + key.
+    real_plc: bool,
+    command: Vec<String>,
+}
+
+impl Config {
+    /// Parse `--ip/-i`, `--port/-p`, `-h/--help`, then treat the first bare token (and
+    /// everything after it) as the command. IP/port fall back to `S7_PLC_IP`/`S7_PLC_PORT`.
+    fn from_args() -> std::result::Result<Config, String> {
+        let mut ip = std::env::var("S7_PLC_IP").ok();
+        let mut port: u16 = std::env::var("S7_PLC_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(s7commplus::transport::tcp::ISO_TCP_PORT);
+        let mut legacy = std::env::var("S7_LEGACY").is_ok();
+        let mut real_plc = std::env::var("S7_REAL_PLC").is_ok();
+        let mut command = Vec::new();
+
+        let mut args = std::env::args().skip(1);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--ip" | "-i" => ip = Some(args.next().ok_or("--ip needs a value")?),
+                "--port" | "-p" => {
+                    let v = args.next().ok_or("--port needs a value")?;
+                    port = v.parse().map_err(|_| format!("invalid port: {v}"))?;
+                }
+                "--legacy" | "-l" => legacy = true,
+                "--real-plc" => real_plc = true,
+                "-h" | "--help" => {
+                    print_usage();
+                    std::process::exit(0);
+                }
+                // First non-flag token starts the command; take the rest verbatim so tag
+                // names are never mistaken for flags.
+                _ => {
+                    command.push(arg);
+                    command.extend(args.by_ref());
+                    break;
+                }
+            }
+        }
+
+        let ip = ip.ok_or("no PLC address — pass --ip <addr> or set S7_PLC_IP")?;
+        Ok(Config {
+            ip,
+            port,
+            legacy,
+            real_plc,
+            command,
+        })
+    }
+}
+
+fn run(cfg: Config) -> Result<()> {
+    let mode = if cfg.real_plc {
+        "legacy real-PLC (00:/01:)"
+    } else if cfg.legacy {
+        "legacy PLCSIM (03:)"
+    } else {
+        "TLS"
+    };
+    println!("connecting to {}:{} ({mode}) ...", cfg.ip, cfg.port);
+    let timeout = Duration::from_secs(10);
+    let mut conn = if cfg.real_plc {
+        // S7_REAL_PLC_KEY=<hex 40-byte pubkey> forces an explicit key (for a PLC whose key
+        // isn't in the bundled store); otherwise the key is auto-selected by fingerprint.
+        match std::env::var("S7_REAL_PLC_KEY").ok().map(|h| {
+            (0..h.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap())
+                .collect::<Vec<u8>>()
+        }) {
+            Some(key) => {
+                Connection::connect_real_plc_with_key((cfg.ip.as_str(), cfg.port), timeout, &key)?
+            }
+            None => Connection::connect_real_plc((cfg.ip.as_str(), cfg.port), timeout)?,
+        }
+    } else if cfg.legacy {
+        Connection::connect_legacy((cfg.ip.as_str(), cfg.port), timeout)?
+    } else {
+        Connection::connect((cfg.ip.as_str(), cfg.port), timeout)?
+    };
+    println!("connected — session_id = 0x{:08x}", conn.session_id());
+
+    if cfg.command.is_empty() {
+        repl(&mut conn)
+    } else {
+        dispatch(&mut conn, &cfg.command)
+    }
+}
+
+/// Read commands from stdin until EOF or `quit`, dispatching each. A failed command prints
+/// its error but keeps the session alive.
+fn repl(conn: &mut Connection) -> Result<()> {
+    println!("interactive mode — 'help' for commands, 'quit' to exit.");
+    let stdin = io::stdin();
+    loop {
+        print!("{PROMPT}");
+        io::stdout().flush().ok();
+
+        let mut line = String::new();
+        if stdin.read_line(&mut line)? == 0 {
+            println!();
+            break; // EOF (Ctrl-D / Ctrl-Z)
+        }
+        let parts: Vec<String> = line.split_whitespace().map(str::to_string).collect();
+        match parts.first().map(String::as_str) {
+            None => continue,
+            Some("quit" | "exit" | "q") => break,
+            Some(_) => {
+                if let Err(e) = dispatch(conn, &parts) {
+                    eprintln!("error: {e}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run one command (`cmd[0]` is the verb, the rest are arguments).
+fn dispatch(conn: &mut Connection, cmd: &[String]) -> Result<()> {
+    match cmd[0].as_str() {
+        "help" | "?" => {
+            print_help();
+            Ok(())
+        }
+        "dbs" => list_dbs(conn),
+        "xexplore" => {
+            // xexplore <hexrelid> [recursive=1] [parents=0] [attr...] — diagnostic explore dump.
+            // Trailing decimal ids restrict the requested attributes (e.g. 2544 = InterfaceDesc).
+            if cmd.len() < 2 {
+                println!("usage: xexplore <hexrelid> [recursive] [parents] [attr_id...]");
+                return Ok(());
+            }
+            let Ok(relid) = u32::from_str_radix(cmd[1].trim_start_matches("0x"), 16) else {
+                println!("bad hex relid: {}", cmd[1]);
+                return Ok(());
+            };
+            let rec = cmd.get(2).and_then(|s| s.parse().ok()).unwrap_or(1u8);
+            let par = cmd.get(3).and_then(|s| s.parse().ok()).unwrap_or(0u8);
+            let attrs: Vec<u32> = cmd
+                .get(4..)
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            print!("{}", conn.explore_dump_attrs(relid, rec, par, &attrs)?);
+            Ok(())
+        }
+        "xblob" => {
+            // xblob <hexrelid> <attr_decimal> <outfile> — save matching blob attribute(s) to a file.
+            if cmd.len() != 4 {
+                println!("usage: xblob <hexrelid> <attr> <outfile>");
+                return Ok(());
+            }
+            let Ok(relid) = u32::from_str_radix(cmd[1].trim_start_matches("0x"), 16) else {
+                println!("bad hex relid: {}", cmd[1]);
+                return Ok(());
+            };
+            let Ok(attr) = cmd[2].parse::<u32>() else {
+                println!("bad attr: {}", cmd[2]);
+                return Ok(());
+            };
+            let blobs = conn.explore_attr_blobs(relid, attr)?;
+            for (i, (objrel, data)) in blobs.iter().enumerate() {
+                let path = if blobs.len() > 1 {
+                    format!("{}.{i}", cmd[3])
+                } else {
+                    cmd[3].clone()
+                };
+                std::fs::write(&path, data)
+                    .map_err(|e| Error::Protocol(format!("write {path}: {e}")))?;
+                println!("wrote {} bytes (obj 0x{objrel:08x}) -> {path}", data.len());
+            }
+            if blobs.is_empty() {
+                println!("no blob attribute {attr} found under 0x{relid:08x}");
+            }
+            Ok(())
+        }
+        "xidents" | "idents" => {
+            // xidents <hexrelid> — extract + inflate the compressed identity/comment blobs of a
+            // DB/object: attr 2449 (IdentES identity XML) and 2546 (LineComments). These are zlib
+            // streams that use a preset dictionary (see s7commplus::decompress_blob). NOTE: this is
+            // identity/comment metadata, NOT the member layout — firmware may withhold both.
+            if cmd.len() < 2 {
+                println!("usage: xidents <hexrelid>   (a DB/object relid, e.g. from `dbs`)");
+                return Ok(());
+            }
+            let Ok(relid) = u32::from_str_radix(cmd[1].trim_start_matches("0x"), 16) else {
+                println!("bad hex relid: {}", cmd[1]);
+                return Ok(());
+            };
+            let mut any = false;
+            for (attr, label) in [(2449u32, "IdentES (identity)"), (2546, "LineComments")] {
+                for (objrel, data) in conn.explore_attr_blobs(relid, attr)? {
+                    if data.is_empty() {
+                        continue;
+                    }
+                    any = true;
+                    print!(
+                        "obj 0x{objrel:08x} attr {attr} ({label}), {} compressed bytes:",
+                        data.len()
+                    );
+                    match inflate_metadata_blob(&data) {
+                        Ok(xml) => println!("\n{xml}\n"),
+                        Err(e) => println!(" <decompress failed: {e}>"),
+                    }
+                }
+            }
+            if !any {
+                println!(
+                    "no identity/comment blobs served for 0x{relid:08x} (firmware may withhold them)"
+                );
+            }
+            Ok(())
+        }
+        "xverify" => {
+            // Cross-check: every browsed VarInfo's access sequence must equal what resolve_symbol
+            // computes from its name (two independent LID implementations agreeing = both correct).
+            let vars = conn.browse_vars()?;
+            let (mut ok, mut bad) = (0u32, 0u32);
+            for v in &vars {
+                match conn.resolve_symbol(&v.name) {
+                    Ok(addr)
+                        if addr.access_area == v.access_area
+                            && addr.access_sub_area == v.access_sub_area
+                            && addr.lid == v.lids =>
+                    {
+                        ok += 1
+                    }
+                    Ok(addr) => {
+                        bad += 1;
+                        println!(
+                            "MISMATCH {}: browse lids={:?} area=0x{:x}  resolve lids={:?} area=0x{:x}",
+                            v.name, v.lids, v.access_area, addr.lid, addr.access_area
+                        );
+                    }
+                    Err(e) => {
+                        bad += 1;
+                        println!("UNRESOLVED {}: {e}", v.name);
+                    }
+                }
+            }
+            println!(
+                "xverify: {ok} consistent, {bad} mismatched (of {} vars)",
+                vars.len()
+            );
+            Ok(())
+        }
+        "browse" => browse(conn, cmd.get(1).map(String::as_str)),
+        "read" => {
+            if cmd.len() < 2 {
+                println!("usage: read <symbol> [<symbol> ...]");
+                return Ok(());
+            }
+            for sym in &cmd[1..] {
+                read_one(conn, sym);
+            }
+            Ok(())
+        }
+        "write" => {
+            if cmd.len() != 3 {
+                println!("usage: write <symbol> <value>");
+                return Ok(());
+            }
+            write_one(conn, &cmd[1], &cmd[2])
+        }
+        "level" => {
+            let level = conn.effective_protection_level()?;
+            let note = if level <= 1 {
+                "full access — no legitimation needed"
+            } else {
+                "restricted — 'legit <user> <pass>' may be required"
+            };
+            println!("effective protection level = {level} ({note})");
+            Ok(())
+        }
+        "legit" => {
+            if cmd.len() != 3 {
+                println!(
+                    "usage: legit <username> <password>   (empty user: legit \"\" <password>)"
+                );
+                return Ok(());
+            }
+            conn.legitimate(&cmd[1], &cmd[2])?;
+            println!("legitimation accepted.");
+            Ok(())
+        }
+        "sub" => {
+            // sub [count=6] [cycle_ms=1000] [notifications=5] [credit] — subscribe to the first
+            // `count` scalar tags and print `notifications` updates. A finite `credit` (e.g. 5)
+            // exercises the auto-refresh; omit for unlimited credit.
+            let count: usize = cmd.get(1).and_then(|s| s.parse().ok()).unwrap_or(6);
+            let cycle: u16 = cmd.get(2).and_then(|s| s.parse().ok()).unwrap_or(1000);
+            let notifs: usize = cmd.get(3).and_then(|s| s.parse().ok()).unwrap_or(5);
+            let credit: Option<i16> = cmd.get(4).and_then(|s| s.parse().ok());
+            subscribe_demo(conn, count, cycle, notifs, credit)
+        }
+        "alarms" => {
+            // alarms [polls=10] — subscribe to program/system alarms and poll for events.
+            let polls: usize = cmd.get(1).and_then(|s| s.parse().ok()).unwrap_or(10);
+            alarms_demo(conn, polls)
+        }
+        other => {
+            println!("unknown command '{other}' — type 'help'");
+            Ok(())
+        }
+    }
+}
+
+/// List the data blocks the driver discovers in the PLC program.
+fn list_dbs(conn: &mut Connection) -> Result<()> {
+    let dbs = conn.datablock_list()?;
+    if dbs.is_empty() {
+        println!("(no data blocks found)");
+        return Ok(());
+    }
+    for db in &dbs {
+        println!(
+            "DB{:<5} {:<26} relid=0x{:08x}  ti=0x{:08x}",
+            db.number, db.name, db.relid, db.ti_relid
+        );
+    }
+    Ok(())
+}
+
+/// Print every readable tag and its current value. With no `target`, dumps all data blocks plus
+/// the M/Q/I controller areas; otherwise limits to one DB name or area (`M`/`Q`/`I`). Uses the
+/// bulk type-info container + a flat variable list, so nested structs and arrays (including
+/// arrays of structs) are fully expanded, and value reads are batched.
+fn browse(conn: &mut Connection, target: Option<&str>) -> Result<()> {
+    let dbs = conn.datablock_list()?;
+    // One bulk fetch of the whole program's type info (best effort; speeds up every block).
+    let _ = conn.prefetch_type_container();
+
+    for db in &dbs {
+        if target.is_some_and(|t| !db.name.eq_ignore_ascii_case(t)) {
+            continue;
+        }
+        println!(
+            "DB \"{}\" (DB{}, relid 0x{:08x}):",
+            db.name, db.number, db.relid
+        );
+        match conn.browse_datablock(db.relid, db.ti_relid, &db.name) {
+            Ok(vars) => print_values(conn, &vars, Some(&db.name)),
+            // A DB whose interface the PLC withholds (TComSize=0, no VartypeList) is the signature
+            // of a know-how-protected FB — not recoverable without the block's know-how password.
+            Err(e) => {
+                println!("  (skipped — interface withheld by PLC, likely know-how protected: {e})")
+            }
+        }
+        println!();
+    }
+
+    // Controller areas (M/Q/I): tags addressed by bare name, no DB prefix.
+    for (area_rid, ti_relid, label, key) in [
+        (82u32, 0x9003_0000u32, "M area", "M"),
+        (81, 0x9002_0000, "Q area", "Q"),
+        (80, 0x9001_0000, "I area", "I"),
+    ] {
+        if target.is_some_and(|t| !t.eq_ignore_ascii_case(key) && !t.eq_ignore_ascii_case(label)) {
+            continue;
+        }
+        let vars = match conn.browse_controller_area(area_rid, ti_relid) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if vars.is_empty() && target.is_none() {
+            continue; // skip empty areas in a full dump
+        }
+        println!("{label} ({} tags):", vars.len());
+        print_values(conn, &vars, None);
+        println!();
+    }
+    Ok(())
+}
+
+/// Read (batched) and print each variable as `name : Type = value`. `strip` removes a leading
+/// `"<prefix>."` from the displayed name (the DB name), so members read like a nested listing.
+fn print_values(conn: &mut Connection, vars: &[VarInfo], strip: Option<&str>) {
+    let values = match conn.read_var_values(vars) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("  (read failed: {e})");
+            return;
+        }
+    };
+    for (var, val) in vars.iter().zip(values) {
+        let disp = match strip {
+            Some(p) => var
+                .name
+                .strip_prefix(p)
+                .and_then(|s| s.strip_prefix('.'))
+                .unwrap_or(&var.name),
+            None => &var.name,
+        };
+        let tname = sdt_name(var.softdatatype);
+        match val {
+            // S7 STRING (softdatatype 19) reads back as a USInt array — decode to text.
+            Some(PValue::USIntArray(bytes)) if var.softdatatype == 19 => {
+                println!("  {disp} : {tname} = {:?}", decode_s7_string(&bytes));
+            }
+            // Date/time types (DTL, DATE, TIME, LDT, …) render as calendar/duration strings.
+            Some(ref v) if datetime::format(var.softdatatype, v).is_some() => {
+                println!(
+                    "  {disp} : {tname} = {}",
+                    datetime::format(var.softdatatype, v).unwrap()
+                );
+            }
+            Some(v) => println!("  {disp} : {tname} = {}", fmt_value(&v)),
+            None => println!("  {disp} : {tname} -> (no value / not readable)"),
+        }
+    }
+}
+
+/// Subscribe to the first `count` scalar tags and print `notifs` update notifications, showing
+/// the credit/change flow and the per-tag values the PLC pushes. A finite `credit` limit
+/// exercises the auto-refresh (the flow continues past the limit); `None` = unlimited.
+fn subscribe_demo(
+    conn: &mut Connection,
+    count: usize,
+    cycle_ms: u16,
+    notifs: usize,
+    credit: Option<i16>,
+) -> Result<()> {
+    use std::collections::HashMap;
+    // Pick scalar tags (skip S7 STRING/struct forms to keep the demo output simple).
+    let chosen: Vec<VarInfo> = conn
+        .browse_vars()?
+        .into_iter()
+        .filter(|v| v.softdatatype != 19)
+        .take(count)
+        .collect();
+    if chosen.is_empty() {
+        println!("no subscribable tags found");
+        return Ok(());
+    }
+    // reference id -> (name, softdatatype) so notifications can be printed by tag name.
+    let mut meta: HashMap<u32, (String, u8)> = HashMap::new();
+    let items: Vec<SubscriptionItem> = chosen
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let reference_id = (i + 1) as u32;
+            meta.insert(reference_id, (v.name.clone(), v.softdatatype));
+            SubscriptionItem {
+                reference_id,
+                address: v.address(),
+            }
+        })
+        .collect();
+
+    let mut sub = match credit {
+        Some(c) => conn.subscribe_with(&items, cycle_ms, 0x14, c)?,
+        None => conn.subscribe(&items, cycle_ms)?,
+    };
+    println!(
+        "subscribed to {} tag(s), cycle {cycle_ms} ms, credit {} (object 0x{:08x}); waiting for {notifs} notification(s)...",
+        items.len(),
+        credit.map_or_else(|| "unlimited".to_string(), |c| c.to_string()),
+        sub.object_id
+    );
+    for i in 1..=notifs {
+        let n = conn.next_notification(&mut sub)?;
+        println!(
+            "notification #{i}: seq={} credit_tick={} values={} errors={}",
+            n.sequence_number,
+            n.credit_tick,
+            n.values.len(),
+            n.errors.len()
+        );
+        for (ref_id, val) in &n.values {
+            let (name, sdt) = meta
+                .get(ref_id)
+                .cloned()
+                .unwrap_or_else(|| (format!("ref#{ref_id}"), 0));
+            let disp = datetime::format(sdt, val).unwrap_or_else(|| fmt_value(val));
+            println!("   {name} = {disp}");
+        }
+        for (ref_id, code) in &n.errors {
+            let name = meta
+                .get(ref_id)
+                .map(|(n, _)| n.clone())
+                .unwrap_or_else(|| format!("ref#{ref_id}"));
+            println!("   {name} -> error 0x{code:02x}");
+        }
+    }
+    Ok(())
+}
+
+/// Subscribe to alarms and poll for `polls` reads, printing any alarm events (coming/going, id,
+/// domain, timestamp). Timeouts (no alarm) are shown but don't abort — alarms are event-driven.
+fn alarms_demo(conn: &mut Connection, polls: usize) -> Result<()> {
+    let mut sub = conn.subscribe_alarms()?;
+    println!(
+        "alarm subscription created (object 0x{:08x}); polling {polls} time(s) for alarm events...",
+        sub.object_id
+    );
+    let mut total = 0usize;
+    for i in 1..=polls {
+        match conn.next_notification(&mut sub) {
+            Ok(n) => {
+                let alarms = n.alarms();
+                if alarms.is_empty() {
+                    println!("  poll #{i}: notification, no alarm objects");
+                }
+                for a in &alarms {
+                    total += 1;
+                    let name = if a.type_name.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{}]", a.type_name)
+                    };
+                    println!(
+                        "  ALARM {:?} id=0x{:016x} domain={} msgtype={} seq={} @ {}{name}",
+                        a.state,
+                        a.cpu_alarm_id,
+                        a.alarm_domain,
+                        a.message_type,
+                        a.sequence_counter,
+                        a.timestamp
+                    );
+                    // Render the message text (prefer en-US = 1033, else the first language sent).
+                    let text = a
+                        .message(1033)
+                        .or_else(|| a.texts.first().and_then(|t| a.message(t.language_id)));
+                    if let Some(msg) = text.filter(|m| !m.is_empty()) {
+                        println!("      text: {msg}");
+                    }
+                    for (i, v) in a.associated_values.iter().enumerate() {
+                        println!("      SD_{} = {v}", i + 1);
+                    }
+                }
+            }
+            Err(e) if e.is_timeout() => println!("  poll #{i}: (no alarm within timeout)"),
+            Err(e) => return Err(e),
+        }
+    }
+    println!("done: {total} alarm event(s) received.");
+    Ok(())
+}
+
+/// Read and print one tag by symbol name.
+fn read_one(conn: &mut Connection, sym: &str) {
+    match conn.read_tag(sym) {
+        // S7 STRINGs read back as a USInt array; decode for display.
+        Ok(PValue::USIntArray(bytes)) => {
+            println!("  {sym} = {:?}  (String)", decode_s7_string(&bytes));
+        }
+        Ok(v) => println!("  {sym} = {}", fmt_value(&v)),
+        Err(e) => println!("  {sym} -> ERROR: {e}"),
+    }
+}
+
+/// Write one tag. The PLC value's type must match, so we read the current value first and
+/// parse the user's text into that same `PValue` variant, then read back to confirm.
+fn write_one(conn: &mut Connection, sym: &str, input: &str) -> Result<()> {
+    let current = conn.read_tag(sym)?;
+    match current {
+        // S7 STRING: the driver frames it from the variable's declared max length.
+        PValue::USIntArray(_) => {
+            conn.write_string(sym, input)?;
+            println!("  {sym} := {:?}  (String)", conn.read_string(sym)?);
+        }
+        scalar => {
+            let value = parse_like(&scalar, input).ok_or_else(|| {
+                Error::Protocol(format!("can't parse {input:?} as {}", type_name(&scalar)))
+            })?;
+            conn.write_tag(sym, value)?;
+            println!("  {sym} := {}", fmt_value(&conn.read_tag(sym)?));
+        }
+    }
+    Ok(())
+}
+
+/// Parse `s` into the same `PValue` variant as `template` (so the wire type matches the PLC
+/// variable). Integer/word types accept an optional `0x` hex prefix. Returns `None` for an
+/// unparseable value or an unsupported (composite) template type.
+fn parse_like(template: &PValue, s: &str) -> Option<PValue> {
+    use PValue::*;
+    let s = s.trim();
+    Some(match template {
+        Bool(_) => Bool(parse_bool(s)?),
+        USInt(_) => USInt(u8::try_from(parse_uint(s)?).ok()?),
+        UInt(_) => UInt(u16::try_from(parse_uint(s)?).ok()?),
+        UDInt(_) => UDInt(u32::try_from(parse_uint(s)?).ok()?),
+        ULInt(_) => ULInt(parse_uint(s)?),
+        Byte(_) => Byte(u8::try_from(parse_uint(s)?).ok()?),
+        Word(_) => Word(u16::try_from(parse_uint(s)?).ok()?),
+        DWord(_) => DWord(u32::try_from(parse_uint(s)?).ok()?),
+        LWord(_) => LWord(parse_uint(s)?),
+        SInt(_) => SInt(s.parse().ok()?),
+        Int(_) => Int(s.parse().ok()?),
+        DInt(_) => DInt(s.parse().ok()?),
+        LInt(_) => LInt(s.parse().ok()?),
+        Real(_) => Real(s.parse().ok()?),
+        LReal(_) => LReal(s.parse().ok()?),
+        _ => return None,
+    })
+}
+
+/// Parse an unsigned integer, accepting an optional `0x`/`0X` hex prefix.
+fn parse_uint(s: &str) -> Option<u64> {
+    match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        None => s.parse().ok(),
+    }
+}
+
+/// Parse a boolean from common spellings.
+fn parse_bool(s: &str) -> Option<bool> {
+    match s.to_ascii_lowercase().as_str() {
+        "1" | "true" | "t" | "on" | "yes" | "y" => Some(true),
+        "0" | "false" | "f" | "off" | "no" | "n" => Some(false),
+        _ => None,
+    }
+}
+
+/// Render a scalar `PValue` compactly for display (word types also show hex).
+fn fmt_value(v: &PValue) -> String {
+    use PValue::*;
+    match v {
+        Bool(b) => b.to_string(),
+        USInt(n) => n.to_string(),
+        UInt(n) => n.to_string(),
+        UDInt(n) => n.to_string(),
+        ULInt(n) => n.to_string(),
+        SInt(n) => n.to_string(),
+        Int(n) => n.to_string(),
+        DInt(n) => n.to_string(),
+        LInt(n) => n.to_string(),
+        Byte(n) => format!("{n} (0x{n:02x})"),
+        Word(n) => format!("{n} (0x{n:04x})"),
+        DWord(n) => format!("{n} (0x{n:08x})"),
+        LWord(n) => format!("{n} (0x{n:016x})"),
+        Real(x) => x.to_string(),
+        LReal(x) => x.to_string(),
+        WString(s) => format!("{s:?}"),
+        USIntArray(b) => format!("{:?} (String)", decode_s7_string(b)),
+        RID(n) => format!("RID(0x{n:08x})"),
+        other => format!("{other:?}"),
+    }
+}
+
+/// The variant name of a scalar `PValue`, for error messages.
+fn type_name(v: &PValue) -> &'static str {
+    use PValue::*;
+    match v {
+        Bool(_) => "Bool",
+        USInt(_) => "USInt",
+        UInt(_) => "UInt",
+        UDInt(_) => "UDInt",
+        ULInt(_) => "ULInt",
+        SInt(_) => "SInt",
+        Int(_) => "Int",
+        DInt(_) => "DInt",
+        LInt(_) => "LInt",
+        Byte(_) => "Byte",
+        Word(_) => "Word",
+        DWord(_) => "DWord",
+        LWord(_) => "LWord",
+        Real(_) => "Real",
+        LReal(_) => "LReal",
+        _ => "this type",
+    }
+}
+
+/// Decode an S7 `STRING` from its USInt-array form `[max_len, actual_len, chars…]` (Latin-1).
+fn decode_s7_string(bytes: &[u8]) -> String {
+    if bytes.len() < 2 {
+        return String::new();
+    }
+    let actual = bytes[1] as usize;
+    let end = (2 + actual).min(bytes.len());
+    bytes[2..end].iter().map(|&b| b as char).collect()
+}
+
+/// Map a Siemens "softdatatype" id to its display name (best-effort; unknowns become `sdtN`).
+fn sdt_name(sdt: u8) -> String {
+    let name = match sdt {
+        1 => "Bool",
+        2 => "Byte",
+        3 => "Char",
+        4 => "Word",
+        5 => "Int",
+        6 => "DWord",
+        7 => "DInt",
+        8 => "Real",
+        9 => "Date",
+        11 => "Time",
+        17 => "Struct",
+        19 => "String",
+        48 => "LReal",
+        49 => "ULInt",
+        50 => "LInt",
+        51 => "LWord",
+        52 => "USInt",
+        53 => "UInt",
+        54 => "UDInt",
+        55 => "SInt",
+        62 => "WString",
+        67 => "DTL",
+        _ => return format!("sdt{sdt}"),
+    };
+    name.to_string()
+}
+
+/// Full usage text (stderr; shown for `-h` and argument errors).
+fn print_usage() {
+    eprintln!(
+        "s7tool — minimal CLI for the s7commplus driver\n\
+         \n\
+         USAGE:\n\
+         \x20   s7tool [--ip <addr>] [--port <n>] [--legacy | --real-plc] [COMMAND ...]\n\
+         \n\
+         CONNECTION (flags must precede the command):\n\
+         \x20   -i, --ip <addr>     PLC address           (or env S7_PLC_IP)\n\
+         \x20   -p, --port <n>      ISO-on-TCP port, def 102 (or env S7_PLC_PORT)\n\
+         \x20   -l, --legacy        use the legacy non-TLS transport (S7-1500 FW < 2.9,\n\
+         \x20                       TIA V16 and older)     (or env S7_LEGACY)\n\
+         \n\
+         With no COMMAND, s7tool connects and opens an interactive prompt.\n"
+    );
+    eprint!("{}", help_body());
+    eprintln!(
+        "\nEXAMPLES:\n\
+         \x20   s7tool --ip 192.168.0.1\n\
+         \x20   s7tool --ip 192.168.0.1 browse\n\
+         \x20   s7tool --ip 192.168.0.1 read Data_block_1.toto Data_block_1.titi\n\
+         \x20   s7tool --ip 192.168.0.1 write Data_block_1.titi 456\n\
+         \x20   s7tool --ip 192.168.0.1 --legacy read Data_block_1.toto"
+    );
+}
+
+/// Command list (stdout; shown for the `help` command inside the REPL).
+/// Inflate a compressed metadata blob (attr 2449 IdentES / 2546 LineComments) to its XML text.
+/// These carry a 4-byte dictionary-version prefix before the zlib stream on this firmware, but
+/// not universally — try `start_offset = 4` first, then fall back to 0.
+fn inflate_metadata_blob(data: &[u8]) -> Result<String> {
+    let out = match s7commplus::decompress_blob(data, 4) {
+        Ok(o) => o,
+        Err(_) => s7commplus::decompress_blob(data, 0)?,
+    };
+    String::from_utf8(out).map_err(|e| Error::Protocol(format!("blob is not UTF-8: {e}")))
+}
+
+fn print_help() {
+    print!("{}", help_body());
+}
+
+fn help_body() -> &'static str {
+    "COMMANDS:\n\
+     \x20   browse [DB|M|Q|I]   recursively list tags with their current values\n\
+     \x20   dbs                 list the data blocks\n\
+     \x20   read <sym>...       read one or more tags by symbol name\n\
+     \x20   write <sym> <val>   write a tag (type inferred from its current value)\n\
+     \x20   level               show the effective protection level\n\
+     \x20   legit <user> <pw>   authenticate (legitimation; experimental)\n\
+     \x20   xidents <relid>     decompress a DB's identity/comment XML (attr 2449/2546)\n\
+     \x20   sub [n] [ms] [k] [c]  subscribe to n tags; print k notifications every ms (opt credit c)\n\
+     \x20   alarms [polls]      subscribe to program/system alarms and poll for events\n\
+     \x20   help                show this help\n\
+     \x20   quit                exit (interactive mode)\n"
+}

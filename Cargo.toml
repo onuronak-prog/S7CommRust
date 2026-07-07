@@ -1,0 +1,56 @@
+[workspace]
+# The driver lives at the repo root; `s7tool` is a separate binary crate that depends
+# on it by path — a worked example of consuming `s7commplus` as an ordinary dependency.
+# (Bulk browse -> CSV export lives in `examples/export_csv.rs`, run via `cargo run --example`.)
+members = ["s7tool"]
+resolver = "2"
+
+[package]
+name = "s7commplus"
+version = "0.1.0"
+edition = "2021"
+# MSRV is set by dependencies (rustls's tree uses edition-2024 crates); the crate's own
+# code compiles on older toolchains, but the dep graph requires 1.85+.
+rust-version = "1.85"
+# LGPL-3.0 for the port itself; MIT covers the legacy (non-TLS) support in
+# `src/legacy/`, which is derived from HarpoS7 — see LICENSE-HarpoS7.
+license = "LGPL-3.0-or-later AND MIT"
+description = "Rust port of the S7CommPlusDriver: TLS-wrapped S7CommPlus driver for Siemens S7-1200/1500 PLCs"
+repository = "https://github.com/sullibar/S7CommRust"
+readme = "README.md"
+keywords = ["siemens", "s7", "plc", "s7commplus", "automation"]
+categories = ["network-programming"]
+# Keep internal/dev-only material out of the published crate. `src/**/*.bin`
+# assets are include_bytes!'d into the library, so they are NOT excluded.
+exclude = ["tools/", "docs/", ".github/"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+# This crate is pure safe Rust — the only native code is inside dependencies. (Complete-doc
+# coverage is enforced lib-scoped via `#![deny(missing_docs)]`, since a package-wide lint would
+# also demand crate docs on every example.)
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+# TLS. MUST expose export_keying_material (RFC 5705) for legitimation. The `ring`
+# backend is used for build reliability across platforms; aws-lc-rs works too.
+# (`rustls::pki_types` re-exports the pki-types crate, so no direct dep on it.)
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# zlib C backend only (no miniz_oxide): needed for the preset-dictionary blobs, and it keeps
+# the dep tree small + the MSRV low.
+flate2 = { version = "1", default-features = false, features = ["zlib"] }
+sha2 = "0.10"             # legitimation key derivation (sha256)
+sha1 = "0.10"             # legacy legitimation-payload password hash
+hmac = "0.12"             # legacy (non-TLS) per-PDU integrity digest (HMAC-SHA256)
+getrandom = "0.2"         # CSPRNG for the legacy auth's ephemeral key material
+aes = "0.8"               # AES-256-CBC...
+cbc = { version = "0.1", features = ["alloc", "block-padding"] }  # ...with PKCS7 padding
+thiserror = "2"
+log = "0.4"
+
+[dev-dependencies]
+hex-literal = "0.4"       # golden byte-vector fixtures
+env_logger = "0.11"       # examples logging
+getrandom = "0.2"         # CSPRNG for the legacy_connect example's ephemeral keys

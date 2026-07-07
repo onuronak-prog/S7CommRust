@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+*.pdb
+# TLS secrets dumped for Wireshark analysis — never commit
+*.keylog
+sslkeys*.log
