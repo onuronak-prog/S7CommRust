@@ -1,0 +1,42 @@
+name: Build S7Tool Windows x64
+
+on:
+workflow_dispatch:
+
+jobs:
+build:
+runs-on: windows-latest
+
+steps:
+- name: Checkout public source
+uses: actions/checkout@v4
+
+- name: Install Rust
+uses: dtolnay/rust-toolchain@stable
+
+- name: Show toolchain
+run: |
+rustc --version
+cargo --version
+
+- name: Build S7Tool
+run: cargo build --release --locked -p s7tool
+
+- name: Collect EXE and licenses
+shell: powershell
+run: |
+New-Item -ItemType Directory -Force -Path artifact
+Copy-Item "target\release\s7tool.exe" "artifact\s7tool.exe"
+Copy-Item "LICENSE" "artifact\LICENSE"
+if (Test-Path "LICENSE-HarpoS7") {
+Copy-Item "LICENSE-HarpoS7" "artifact\LICENSE-HarpoS7"
+}
+Get-FileHash "artifact\s7tool.exe" -Algorithm SHA256 |
+Format-List |
+Out-File "artifact\SHA256.txt"
+
+- name: Upload Windows executable
+uses: actions/upload-artifact@v4
+with:
+name: s7tool-windows-x64
+path: artifact
